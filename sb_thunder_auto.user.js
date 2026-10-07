@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      1.1.0
-// @description  雷霆战机自动驾驶：练习/正式计奖、前台可视/后台稳定、局数控制、智能躲弹与历史统计。
+// @version      2.0.0
+// @description  雷霆战机自动驾驶：用游戏自己的引擎做前瞻模拟，追杀敌机、拦截补给、吃满增益、击落 Boss；练习/正式计奖、前台可视/后台稳定。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
 // @grant        none
@@ -328,6 +328,283 @@
     };
   }
 
+
+  /* ------------------------------------------------------------------ *
+   * 前瞻规划 AI（v2）
+   * 用一份私有的游戏引擎实例做"先试再走"：每 8 帧把当前局面存档，分别试走
+   * 每个候选方向 8 帧，再按追击策略继续推演 1~2 秒，用引擎算出的真实结果
+   * （得分、击毁、拾取、Boss 掉血、是否受伤）挑最好的方向。
+   * 引擎是确定性的，推演结果与服务器重演完全一致。
+   * ------------------------------------------------------------------ */
+  const PLAN_K = 8;          // 每次决策执行的帧数
+  const PLAN_H = 60;         // 普通推演帧数
+  const PLAN_H_GOAL = 120;   // 场上有补给机/增益时的推演帧数
+  const HUNT_EVERY = 3;      // 推演中追击策略每几帧重算一次
+  const ITEM_V = 1.5;        // 道具下落速度 px/帧
+  const BOLT_V = 14;         // 子弹速度 px/帧
+  const PLAYER_V = 6;        // 飞机满速 px/帧
+  const ENEMY_POINTS = { 2: 50, 3: 150, 4: 50 };
+  const ENT_LIGHT = 2, ENT_HEAVY = 3, ENT_SUPPLY = 4, ENT_CORE = 7, ENT_SHIELD = 8, ENT_REPAIR = 9;
+
+  const planner = {
+    engine: null,      // 私有引擎（不碰页面的引擎）
+    go: null,
+    mem: null,
+    blocMaxAddr: -1,
+    buf: new Uint8Array(4 * (24 + 5 * 2048)),
+    ints: null,
+    plan: [],
+    held: 512,
+    supplyVx: null,
+    lastSupply: null,
+    ready: false,
+  };
+  planner.ints = new Int32Array(planner.buf.buffer);
+
+  async function loadPlannerEngine() {
+    if (planner.ready) return planner;
+    if (!window.Go) throw new Error('页面的 wasm_exec 还没加载');
+    const pageEngine = window.bbsThunder;
+    const go = new window.Go();
+    const bytes = await (await fetch(CFG.Wasm, { credentials: 'same-origin' })).arrayBuffer();
+    const { instance } = await WebAssembly.instantiate(bytes, go.importObject);
+    go.run(instance);
+    for (let i = 0; i < 200 && window.bbsThunder === pageEngine; i++) await new Promise(r => setTimeout(r, 10));
+    const mine = window.bbsThunder;
+    // 还原页面引用：页面自己的游戏继续用它原来那份引擎。
+    if (pageEngine) window.bbsThunder = pageEngine;
+    if (!mine || mine === pageEngine) throw new Error('私有引擎启动失败');
+    planner.engine = mine;
+    planner.go = go;
+    planner.mem = instance.exports.mem;
+    planner.ready = true;
+    return planner;
+  }
+
+  // Go 的 wasm 运行时把 sbrk 的 (bloc, blocMax) 放在线性内存里。恢复一个较小的旧存档后
+  // 把 blocMax 抬回真实内存大小，运行时就会复用已增长的内存，不会每次都再 grow。
+  function findBlocMax() {
+    const dv = new DataView(planner.mem.buffer);
+    const size = planner.mem.buffer.byteLength;
+    for (let a = 0; a < Math.min(size, 8 << 20) - 16; a += 8) {
+      if (dv.getUint32(a + 4, true) || dv.getUint32(a + 12, true)) continue;
+      if (dv.getUint32(a, true) === size && dv.getUint32(a + 8, true) === size) return a + 8;
+    }
+    return -1;
+  }
+
+  function planSave() {
+    if (planner.blocMaxAddr < 0) planner.blocMaxAddr = findBlocMax();
+    const go = planner.go;
+    return {
+      m: new Uint8Array(planner.mem.buffer).slice(),
+      v: go._values.slice(),
+      r: go._goRefCounts.slice(),
+      ids: new Map(go._ids),
+      pool: go._idPool.slice(),
+    };
+  }
+
+  function planLoad(snap) {
+    const cur = new Uint8Array(planner.mem.buffer);
+    cur.set(snap.m);
+    if (cur.length > snap.m.length && planner.blocMaxAddr >= 0) {
+      new DataView(planner.mem.buffer).setUint32(planner.blocMaxAddr, cur.length, true);
+    }
+    const go = planner.go;
+    go._values = snap.v.slice();
+    go._goRefCounts = snap.r.slice();
+    go._ids = new Map(snap.ids);
+    go._idPool = snap.pool.slice();
+  }
+
+  function planFill() {
+    return planner.engine.fill(planner.buf) || 0;
+  }
+
+  function planEntities(count) {
+    const n = planner.ints;
+    const out = [];
+    for (let i = 24; i + 5 <= count; i += 5) out.push([n[i], n[i + 1] / FIX, n[i + 2] / FIX]);
+    return out;
+  }
+
+  function itemWanted(t, lives, power, shield) {
+    if (t === ENT_CORE) return power < 5 ? 1.0 : 0.6;     // 满级后也给 100 分
+    if (t === ENT_SHIELD) return shield ? 0.45 : 0.9;
+    if (t === ENT_REPAIR) return lives < 3 ? 1.2 : 0.45;
+    return 0;
+  }
+
+  function supplyLeadX(x, y, py) {
+    const vx = planner.supplyVx ?? (x > WIDTH / 2 ? -2 : 2);
+    return x + vx * Math.max(0, (py - y) / BOLT_V);
+  }
+
+  function steerTo(px, py, tx, ty) {
+    const dx = tx - px;
+    const dy = Math.max(-150, Math.min(150, ty - py));
+    const dist = Math.hypot(dx, dy);
+    if (dist < 2) return 512;
+    const d = Math.round(Math.atan2(dx, -dy) / (2 * Math.PI) * 32);
+    return encodeInput(((d % 32) + 32) % 32, dist >= PLAYER_V ? 8 : Math.max(1, Math.round(dist * 8 / PLAYER_V)), true);
+  }
+
+  // 推演用的追击策略：优先拦截增益、提前量打补给机、对准最近的敌机，Boss 战对准 Boss。
+  function hunterInput(count) {
+    const n = planner.ints;
+    const px = n[16] / FIX, py = n[17] / FIX, lives = n[2], power = n[3], shield = n[4];
+    let tx = null, ty = 660, best = -1e9;
+    for (const [t, x, y] of planEntities(count)) {
+      let w, gx = x, gy = 660;
+      if (t >= ENT_CORE && t <= ENT_REPAIR) {
+        const want = itemWanted(t, lives, power, shield);
+        if (!want) continue;
+        const tReach = Math.max(1, (py - y) / ITEM_V);
+        if (Math.abs(x - px) > PLAYER_V * tReach + 30 && y < py) continue;
+        w = 2000 * want - Math.abs(x - px) * 0.8;
+        gy = Math.min(700, Math.max(560, y + 40));
+      } else if (t === ENT_SUPPLY) {
+        gx = supplyLeadX(x, y, py);
+        w = 1500 - Math.abs(gx - px) * 0.8;
+      } else if (t === ENT_LIGHT || t === ENT_HEAVY) {
+        if (y > py - 40 || y < -30) continue;
+        w = ENEMY_POINTS[t] * 5 - (py - y) * 0.6 - Math.abs(x - px) * 1.2;
+      } else continue;
+      if (w > best) { best = w; tx = gx; ty = gy; }
+    }
+    if (n[10] > 0 && n[9] > 0 && (tx === null || best < 1500)) {
+      tx = n[18] / FIX;
+      ty = Math.min(700, Math.max(560, n[19] / FIX + 450));
+    }
+    if (tx === null) tx = WIDTH / 2;
+    return steerTo(px, py, tx, ty);
+  }
+
+  // 推演终点的局面价值：和敌机/补给机对齐、来得及接住道具、Boss 战对准 Boss。
+  function leafValue(count) {
+    const n = planner.ints;
+    const px = n[16] / FIX, py = n[17] / FIX, lives = n[2], power = n[3], shield = n[4];
+    let v = 0;
+    for (const [t, x, y] of planEntities(count)) {
+      if (t >= ENT_CORE && t <= ENT_REPAIR) {
+        const want = itemWanted(t, lives, power, shield);
+        if (!want || y > py + 20) continue;
+        const reach = PLAYER_V * Math.max(1, (790 - y) / ITEM_V) - Math.abs(x - px);
+        v += 300 * want * (reach > 60 ? 1 - Math.min(1, Math.abs(x - px) / 400) * 0.4 : reach > 0 ? 0.5 : -0.6);
+      } else if (t === ENT_SUPPLY) {
+        v += 140 * Math.exp(-((supplyLeadX(x, y, py) - px) ** 2) / (2 * 30 * 30));
+      } else if ((t === ENT_LIGHT || t === ENT_HEAVY) && y < py - 40) {
+        v += ENEMY_POINTS[t] * 0.35 * Math.exp(-((x - px) ** 2) / (2 * 28 * 28));
+      }
+    }
+    if (n[10] > 0 && n[9] > 0) v += 320 * Math.exp(-((n[18] / FIX - px) ** 2) / (2 * 36 * 36));
+    v -= Math.max(0, 540 - py) * 0.3;
+    return v;
+  }
+
+  const PLAN_ACTIONS = (() => {
+    const out = [512];
+    for (let d = 0; d < 32; d += 2) out.push(encodeInput(d, 8, true));
+    for (let d = 0; d < 32; d += 8) out.push(encodeInput(d, 3, true));
+    return out;
+  })();
+  const PLAN_ACTIONS_KEYS = (() => {
+    const out = [512];
+    for (let d = 0; d < 32; d += 4) out.push(encodeInput(d, 8, true));
+    return out;
+  })();
+
+  function plannerReset() {
+    planner.plan = [];
+    planner.held = 512;
+    planner.supplyVx = null;
+    planner.lastSupply = null;
+  }
+
+  function readPlannerSnapshot() {
+    const count = planFill();
+    if (count < 24) return null;
+    const n = planner.ints;
+    return {
+      frame: n[0], score: n[1], lives: n[2], power: n[3], shield: n[4], combo: n[6], endReason: n[8],
+      bossHp: n[9], bossMax: n[10], x: n[16] / FIX, y: n[17] / FIX,
+      entities: planEntities(count).map(([type, x, y]) => ({ type, x, y })),
+    };
+  }
+
+  /**
+   * 在私有引擎当前局面上选下一帧输入。keysOnly=true 时只用 8 个方向满速（前台键盘可表达）。
+   * holdFire=true 时不开火（保分）。
+   */
+  function plannerChoose(keysOnly = false, holdFire = false) {
+    const snap = readPlannerSnapshot();
+    if (!snap) return 512;
+
+    const sup = snap.entities.find(e => e.type === ENT_SUPPLY);
+    if (sup && planner.lastSupply) planner.supplyVx = Math.sign(sup.x - planner.lastSupply.x) * 2 || planner.supplyVx;
+    planner.lastSupply = sup || null;
+    if (!sup) planner.supplyVx = null;
+
+    const fireMask = holdFire ? ~512 : ~0;
+    if (planner.plan.length) return planner.plan.shift() & fireMask;
+
+    const E = planner.engine;
+    const n = planner.ints;
+    const S = planSave();
+    const cands = (keysOnly ? PLAN_ACTIONS_KEYS : PLAN_ACTIONS).map(a => a & fireMask);
+    if (!keysOnly) cands.push(hunterInput(planFill()) & fireMask);
+    const goal = snap.entities.some(e =>
+      e.type === ENT_SUPPLY ||
+      (e.type >= ENT_CORE && e.type <= ENT_REPAIR && itemWanted(e.type, snap.lives, snap.power, snap.shield) > 0.3));
+    const horizon = goal ? PLAN_H_GOAL : PLAN_H;
+    const bossPhase = snap.bossMax > 0;
+
+    let best = -Infinity, bestA = 512, bestHurt = false;
+    for (const a of cands) {
+      planLoad(S);
+      let v = 0, hurtAt = -1, dead = false, hunt = 512;
+      for (let f = 0; f < horizon; f++) {
+        let input = a;
+        if (f >= PLAN_K) {
+          if ((f - PLAN_K) % HUNT_EVERY === 0) {
+            hunt = hunterInput(planFill());
+            if (keysOnly && hunt !== 512) hunt = encodeInput(((((hunt >> 4) & 31) + 2) >> 2 << 2) & 31, 8, true);
+            hunt &= fireMask;
+          }
+          input = hunt;
+        }
+        const ev = E.step(input);
+        if (ev & 16) v += 600;                       // 拾取增益
+        if ((ev & 96) && hurtAt < 0) hurtAt = f;     // 受伤（含护盾被打掉）
+        if (ev & 1024) { dead = true; break; }       // 坠机
+      }
+      const count = planFill();
+      v += n[1] - snap.score;
+      if (bossPhase) v += (snap.bossHp - n[9]) * 0.6;
+      v += (n[3] - snap.power) * 250 + (n[4] - snap.shield) * 300 + (n[2] - snap.lives) * 4000;
+      v += leafValue(count);
+      if (n[8] === 3) v += 3000;                     // 击落 Boss 提前结束
+      if (hurtAt >= 0) {
+        const base = bossPhase ? (snap.lives >= 3 ? 1500 : snap.lives === 2 ? 3000 : 12000) : 4500;
+        v -= base * (1.6 - hurtAt / horizon) + snap.combo * 60 + 250;
+      }
+      if (dead) v -= 80000;
+      if (a === planner.held) v += 2;
+      if (v > best) { best = v; bestA = a; bestHurt = hurtAt >= 0; }
+    }
+    planLoad(S);
+    planner.held = bestA;
+    planner.plan = Array(PLAN_K - 1).fill(bestA);
+
+    const vec = inputVector(bestA);
+    const arrows = (vec.dx < -0.3 ? '←' : vec.dx > 0.3 ? '→' : '') + (vec.dy < -0.3 ? '↑' : vec.dy > 0.3 ? '↓' : '');
+    const focus = bossPhase ? 'Boss ' + snap.bossHp : goal ? '拦截补给/增益' : '追击';
+    aiText = '前瞻 · ' + focus + ' · ' + (arrows || '停') + (bestHurt ? ' · 难免受伤' : '');
+    return bestA;
+  }
+
+  // 旧版启发式 AI（引擎加载失败时的兜底）
   function chooseAutoInput(snap) {
     if (!snap) return 512;
 
@@ -463,6 +740,63 @@
       (arrows || '停');
 
     return bestValue;
+  }
+
+
+  /* ------------------------------------------------------------------ *
+   * 前台镜像：给页面引擎的 start/step 套一层，同步驱动私有引擎，
+   * 这样规划器看到的局面和屏幕上一模一样，且不改变页面提交的任何输入。
+   * ------------------------------------------------------------------ */
+  const mirror = { hooked: false, synced: false, frames: 0, pending: 0 };
+
+  function hookPageEngine(engine) {
+    if (!engine || engine.__tfMirror) return;
+    const origStart = engine.start.bind(engine);
+    const origStep = engine.step.bind(engine);
+    engine.start = function (seed) {
+      const r = origStart(seed);
+      try {
+        if (planner.ready) {
+          planner.engine.start(String(seed));
+          plannerReset();
+          mirror.synced = true;
+          mirror.frames = 0;
+        }
+      } catch { mirror.synced = false; }
+      return r;
+    };
+    engine.step = function (input) {
+      const r = origStep(input);
+      if (mirror.synced) {
+        try { planner.engine.step(input); mirror.frames++; mirror.pending++; } catch { mirror.synced = false; }
+      }
+      return r;
+    };
+    engine.__tfMirror = true;
+    mirror.hooked = true;
+  }
+
+  async function ensureMirror() {
+    const engine = await waitForEngine();
+    await loadPlannerEngine();
+    hookPageEngine(engine);
+    if (!mirror.synced && state?.status === 'active' && state.seed) {
+      // 接管进行中的局：用服务器记录的输入把私有引擎追到同一帧，再核对一次。
+      planner.engine.start(String(state.seed));
+      for (const v of decodeInputs(state.inputs || '')) planner.engine.step(v);
+      const a = readEngineSnapshot();
+      const b = readPlannerSnapshot();
+      mirror.synced = !!(a && b && a.frame === b.frame && a.score === b.score && Math.abs(a.x - b.x) < 0.01);
+      mirror.frames = b?.frame || 0;
+    }
+    return mirror.synced;
+  }
+
+  function mirrorInSync() {
+    if (!mirror.synced) return false;
+    const a = readEngineSnapshot();
+    const b = readPlannerSnapshot();
+    return !!(a && b && a.frame === b.frame && a.score === b.score && Math.abs(a.x - b.x) < 0.01 && Math.abs(a.y - b.y) < 0.01);
   }
 
   function keyEvent(type, code) {
@@ -706,7 +1040,21 @@
       return;
     }
 
-    const input = chooseAutoInput(snap);
+    let input;
+    if (planner.ready && mirrorInSync()) {
+      // 页面每帧推进一次；只在有新帧时重新规划，保持和画面同步。
+      if (mirror.pending > 0) {
+        mirror.pending = 0;
+        planner.plan = [];
+        input = plannerChoose(true, false);
+        planner.lastVisibleInput = input;
+      } else {
+        input = planner.lastVisibleInput ?? 512;
+      }
+    } else {
+      if (planner.ready && mirror.synced) mirror.synced = false;
+      input = chooseAutoInput(snap);
+    }
     applyVisibleInput(input);
 
     statusText =
@@ -717,8 +1065,21 @@
     render();
   }
 
+
+  // 后台模式用的引擎：优先私有规划引擎（可存档推演），失败时退回页面引擎 + 旧 AI。
+  let bgEngine = null;
+  let bgUsePlanner = false;
+
   async function prepareBackgroundGame(s) {
-    const engine = await waitForEngine();
+    try {
+      await loadPlannerEngine();
+      bgEngine = planner.engine;
+      bgUsePlanner = true;
+    } catch (e) {
+      console.warn('[TF AUTO] 前瞻引擎不可用，退回旧 AI：', e);
+      bgEngine = await waitForEngine();
+      bgUsePlanner = false;
+    }
 
     bgGame = s;
     state = s;
@@ -727,12 +1088,13 @@
     bgFrame = 0;
     bgEnding = false;
     bgPending = null;
+    plannerReset();
 
-    engine.start(String(s.seed));
+    bgEngine.start(String(s.seed));
 
     const prior = decodeInputs(s.inputs || '');
     for (const input of prior) {
-      engine.step(input);
+      bgEngine.step(input);
       bgFrame++;
     }
 
@@ -741,9 +1103,10 @@
     }
 
     registerStarted(s);
-    statusText = '后台引擎已就绪，等待开局时间…';
+    statusText = (bgUsePlanner ? '前瞻引擎已就绪' : '后台引擎已就绪') + '，等待开局时间…';
     render();
   }
+
 
   async function apiStartBackgroundGame() {
     if (!session.running || !canStartMore() || targetReached()) return;
@@ -804,14 +1167,17 @@
     return accepted;
   }
 
-  async function generateOneChunk() {
-    if (!bgGame || bgPending || bgEnding) return;
+  function bgSnapshot() {
+    return bgUsePlanner ? readPlannerSnapshot() : readEngineSnapshot();
+  }
 
-    const engine = await waitForEngine();
+  async function generateOneChunk() {
+    if (!bgGame || bgPending || bgEnding || !bgEngine) return;
+
     const inputs = [];
 
     for (let i = 0; i < FPS && bgFrame < MAX_FRAMES; i++) {
-      const before = readEngineSnapshot();
+      const before = bgSnapshot();
       if (before?.endReason) {
         bgEnding = true;
         break;
@@ -825,19 +1191,20 @@
         scoreHoldGameId = bgGame.id;
       }
 
-      let input = chooseAutoInput(before);
+      const holdFire = scoreHoldGameId === bgGame?.id;
+      let input = bgUsePlanner ? plannerChoose(false, holdFire) : chooseAutoInput(before);
 
-      if (scoreHoldGameId === bgGame?.id) {
+      if (holdFire) {
         // 后台保分：继续躲弹，但关闭自动开火，尽量不再通过击毁增加分数。
         input &= ~512;
         aiText = '本局已达保分分数 · 停火保命';
       }
 
       inputs.push(input);
-      engine.step(input);
+      bgEngine.step(input);
       bgFrame++;
 
-      const after = readEngineSnapshot();
+      const after = bgSnapshot();
       if (after?.endReason) {
         bgEnding = true;
         break;
@@ -853,6 +1220,7 @@
 
     if (bgFrame >= MAX_FRAMES) bgEnding = true;
   }
+
 
   async function finishBackgroundGame() {
     if (!bgGame) return;
@@ -922,7 +1290,7 @@
       );
 
       if (bgSeq >= dueChunks) {
-        const snap = readEngineSnapshot();
+        const snap = bgSnapshot();
 
         if (snap) {
           statusText =
@@ -940,7 +1308,7 @@
         await sendPendingChunk();
       }
 
-      const snap = readEngineSnapshot();
+      const snap = bgSnapshot();
       if (snap?.endReason) bgEnding = true;
 
       if (bgEnding && !bgPending) {
@@ -1038,7 +1406,10 @@
     ui.status.textContent = statusText;
     ui.ai.textContent = aiText;
 
-    const liveSnap = readEngineSnapshot();
+    const liveSnap =
+      session.running && settings.runMode === 'background' && bgGame && bgUsePlanner
+        ? readPlannerSnapshot()
+        : readEngineSnapshot();
 
     ui.score.textContent =
       liveSnap
@@ -1080,8 +1451,8 @@
 
     ui.foot.textContent =
       settings.runMode === 'background'
-        ? '后台稳定：WASM 本地模拟 + 正常 Input/Finish 接口，每 60 帧提交一次'
-        : '前台可视：原页面负责渲染和提交，脚本只自动控制方向';
+        ? '后台稳定：前瞻 AI 在私有引擎上推演选路，按正常 Input/Finish 接口每 60 帧提交'
+        : '前台可视：原页面负责渲染和提交；前瞻 AI 镜像同一局面，用方向键操控';
 
     ui.error.textContent = stateError ? '错误：' + stateError : '';
     ui.body.hidden = !!settings.collapsed;
@@ -1112,6 +1483,16 @@
 
       const current = await getState();
       state = current;
+
+      if (settings.runMode === 'visible') {
+        try {
+          const synced = await ensureMirror();
+          aiText = synced || current?.status !== 'active' ? '前瞻 AI 已就绪' : '前瞻 AI 未能接管本局，本局用旧 AI';
+        } catch (e) {
+          console.warn('[TF AUTO] 前瞻引擎不可用，前台使用旧 AI：', e);
+          aiText = '前瞻引擎不可用，使用旧 AI';
+        }
+      }
 
       if (settings.mode === 'formal') {
         const check = formalPrecheck(current);
@@ -1205,7 +1586,7 @@
   panel.id = 'tf-auto-panel';
   panel.innerHTML =
     '<div class="tfa-head">' +
-      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v1.1</small></div>' +
+      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.0</small></div>' +
       '<button id="tfa-collapse" type="button">收起</button>' +
     '</div>' +
 
@@ -1230,7 +1611,7 @@
           '</select>' +
         '</label>' +
 
-        '<label>AI 策略' +
+        '<label>兜底 AI 策略' +
           '<select id="tfa-strategy">' +
             '<option value="survival">保命优先</option>' +
             '<option value="balanced">均衡</option>' +
@@ -1459,8 +1840,15 @@
     if (session.running && settings.runMode === 'visible') syncVisibleState();
   }, 650);
 
+  // 前台：每个动画帧（和页面推进游戏同一节奏）做一次控制。
+  (function rafLoop() {
+    if (session.running && settings.runMode === 'visible') {
+      try { visibleControlTick(); } catch (e) { console.warn('[TF AUTO]', e); }
+    }
+    requestAnimationFrame(rafLoop);
+  })();
+
   controlTimer = setInterval(() => {
-    if (session.running && settings.runMode === 'visible') visibleControlTick();
 
     if (
       session.running &&
@@ -1493,7 +1881,12 @@
     decodeInputs,
     readEngineSnapshot,
     chooseAutoInput,
+    plannerChoose,
+    readPlannerSnapshot,
+    loadPlannerEngine,
+    planner,
+    mirror,
   };
 
-  console.log('[TF AUTO] v1.1 已加载：练习/正式计奖 + 前台可视/后台稳定 + 保分分数 + 自动躲弹。');
+  console.log('[TF AUTO] v2.0 已加载：前瞻规划 AI + 练习/正式计奖 + 前台可视/后台稳定 + 保分分数。');
 })();
