@@ -2,6 +2,18 @@
 
 sb.sb 游戏辅助 Userscript 集合。
 
+## 一键安装
+
+先安装 [Tampermonkey](https://www.tampermonkey.net/)，然后点击对应按钮即可打开安装页：
+
+| 脚本 | 一键安装 |
+| --- | --- |
+| Blackjack Auto Pro | [![安装 Blackjack](https://img.shields.io/badge/Tampermonkey-安装_Blackjack-2ea44f?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://raw.githubusercontent.com/Xiyueyy/sb_auto/main/sb_blackjack_auto.user.js) |
+| 消消乐 Auto | [![安装消消乐](https://img.shields.io/badge/Tampermonkey-安装_消消乐-2ea44f?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://raw.githubusercontent.com/Xiyueyy/sb_auto/main/sb_match3_auto.user.js) |
+| 雷霆战机 Auto | [![安装雷霆战机](https://img.shields.io/badge/Tampermonkey-安装_雷霆战机-2ea44f?style=for-the-badge&logo=tampermonkey&logoColor=white)](https://raw.githubusercontent.com/Xiyueyy/sb_auto/main/sb_thunder_auto.user.js) |
+
+> 已安装旧版本时，点击同一个按钮会进入 Tampermonkey 的更新/重新安装页面。
+
 ## 脚本
 
 ### Blackjack Auto Pro（v3）
