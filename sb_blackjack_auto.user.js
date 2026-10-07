@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         sb.sb Blackjack Auto Pro
 // @namespace    https://sb.sb/
-// @version      2.0.0
-// @description  自动下注 + 基本策略自动操作；使用页面原生按钮，所以发牌、等待 drand、动画、结算都会正常显示。带局数控制、会话统计和本地历史记录。
+// @version      2.1.0
+// @description  自动下注 + 基本策略；支持前台可视原生操作与后台稳定 API 模式，带局数控制、会话统计和本地历史记录。
 // @match        https://sb.sb/games/blackjack/*
 // @run-at       document-idle
 // @grant        none
@@ -13,6 +13,7 @@
 
   const root = document.querySelector('[data-bj]');
   const configEl = document.getElementById('blackjack-config');
+  const csrfEl = document.querySelector('input[name="_csrf"]');
   if (!root || !configEl) {
     console.warn('[BJ AUTO PRO] 找不到游戏区域或配置。');
     return;
@@ -40,6 +41,7 @@
 
   const settings = Object.assign({
     bet: 10,
+    runMode: 'visible',
     targetGames: 3,
     actionDelay: 350,
     keepHistory: true,
@@ -78,6 +80,9 @@
   let syncTimer = null;
   let statusText = '准备就绪';
   let recommendationText = '—';
+  let apiBusy = false;
+  let heartbeatWorker = null;
+  let heartbeatUrl = null;
 
   function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -91,6 +96,79 @@
   function sleepLoop(ms = 150) {
     clearTimeout(loopTimer);
     loopTimer = setTimeout(mainLoop, ms);
+  }
+
+  function newRequestID() {
+    return window.bbsGame?.newRequestID?.() ||
+      (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  }
+
+  function csrfToken() {
+    return document.querySelector('input[name="_csrf"]')?.value || csrfEl?.value || '';
+  }
+
+  function startBackgroundHeartbeat() {
+    stopBackgroundHeartbeat();
+
+    const code = `
+      let timer = null;
+      onmessage = (event) => {
+        const data = event.data || {};
+        if (data.cmd === 'start') {
+          clearInterval(timer);
+          timer = setInterval(() => postMessage('tick'), Math.max(80, Number(data.ms) || 180));
+        } else if (data.cmd === 'stop') {
+          clearInterval(timer);
+          timer = null;
+        }
+      };
+    `;
+
+    try {
+      heartbeatUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+      heartbeatWorker = new Worker(heartbeatUrl);
+    } catch (e) {
+      if (heartbeatUrl) URL.revokeObjectURL(heartbeatUrl);
+      heartbeatUrl = null;
+      heartbeatWorker = null;
+      console.warn('[BJ AUTO PRO] Worker 心跳不可用，回退到页面定时器。', e);
+      return;
+    }
+    heartbeatWorker.onmessage = () => {
+      if (session.running && settings.runMode === 'background') mainLoop();
+    };
+    heartbeatWorker.postMessage({ cmd: 'start', ms: 180 });
+  }
+
+  function stopBackgroundHeartbeat() {
+    if (heartbeatWorker) {
+      try { heartbeatWorker.postMessage({ cmd: 'stop' }); } catch {}
+      heartbeatWorker.terminate();
+      heartbeatWorker = null;
+    }
+    if (heartbeatUrl) {
+      URL.revokeObjectURL(heartbeatUrl);
+      heartbeatUrl = null;
+    }
+  }
+
+  async function postAPI(url, data) {
+    const form = new FormData();
+    form.set('_csrf', csrfToken());
+    for (const [key, value] of Object.entries(data)) form.set(key, String(value));
+
+    const r = await fetch(url, {
+      method: 'POST',
+      body: form,
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+    });
+
+    const body = await r.json();
+    if (!r.ok || (body?.error && !body?.id)) {
+      throw new Error(body?.error || `HTTP ${r.status}`);
+    }
+    return body;
   }
 
   function isVisible(el) {
@@ -179,9 +257,9 @@
   }
 
   // 6D / S17 / DAS / no surrender / no insurance
-  function decide(cards, dealerCard) {
+  function decide(cards, dealerCard, canOverride = null) {
     const dealer = valueFromRank(dealerCard.rank);
-    const can = {
+    const can = canOverride || {
       hit: actionAvailable('hit'),
       stand: actionAvailable('stand'),
       double: actionAvailable('double'),
@@ -254,6 +332,31 @@
       return { action: stand ? 'stand' : 'hit', reason: `硬 ${total} vs ${dealerText(dealer)} → ${stand ? '停牌' : '要牌'}` };
     }
     return { action: 'stand', reason: `硬 ${total} vs ${dealerText(dealer)} → 停牌` };
+  }
+
+  function cardObjectFromId(id) {
+    const n = Number(id);
+    return {
+      rank: RANKS[((n % 13) + 13) % 13],
+      label: cardLabelFromId(n),
+    };
+  }
+
+  function decideFromState(s) {
+    const hand = s?.hands?.[s.active];
+    const dealerId = s?.dealer?.[0];
+    if (!hand || dealerId == null) return null;
+
+    const cards = (hand.cards || []).map(cardObjectFromId);
+    const dealerCard = cardObjectFromId(dealerId);
+    const can = {
+      hit: !!s?.can?.Hit,
+      stand: !!s?.can?.Stand,
+      double: !!s?.can?.Double,
+      split: !!s?.can?.Split,
+    };
+
+    return decide(cards, dealerCard, can);
   }
 
   function phaseFromDOM() {
@@ -380,7 +483,9 @@
     render();
   }
 
-  async function syncState() {
+  async function syncState(force = false) {
+    if (!force && session.running && settings.runMode === 'background') return;
+
     try {
       const s = await getState();
       lastState = s;
@@ -457,8 +562,115 @@
     }
   }
 
+  async function apiStartGame(s) {
+    const target = Number(settings.targetGames) || 0;
+    if (target > 0 && session.started >= target) return;
+
+    const bet = Number(settings.bet);
+    const coins = Number(s?.coins ?? session.currentCoins ?? 0);
+    if (Number.isFinite(coins) && coins < bet) {
+      stopAuto(`余额 ${coins}，不足下注 ${bet}`);
+      return;
+    }
+
+    statusText = `后台接口下注 ${bet}，开始第 ${session.started + 1} 局`;
+    const res = await postAPI(CFG.Start, {
+      request: newRequestID(),
+      bet,
+    });
+
+    lastState = res;
+    if (res?.coins != null) session.currentCoins = Number(res.coins);
+    if (res?.id) registerStartedGame(res);
+  }
+
+  async function apiMoveGame(s, action, reason) {
+    const key = `${s.id}:${s.seq}:${s.phase}:${s.active}:${action}`;
+    if (lastActionFingerprint === key && Date.now() - lastActionAt < 1800) return;
+
+    lastActionFingerprint = key;
+    lastActionAt = Date.now();
+    lastState = s;
+    recommendationText = reason;
+    logAction(action, reason);
+    statusText = `后台接口执行：${reason}`;
+
+    const res = await postAPI(CFG.Move, {
+      game: s.id,
+      seq: s.seq,
+      move: action,
+    });
+
+    lastState = res;
+    if (res?.coins != null) session.currentCoins = Number(res.coins);
+    if (res?.status === 'settled') recordSettlement(res);
+  }
+
+  async function apiMainLoop() {
+    if (!session.running || settings.runMode !== 'background' || apiBusy) return;
+
+    apiBusy = true;
+    try {
+      const s = await getState();
+      lastState = s;
+      lastStateError = '';
+
+      if (s?.coins != null) {
+        session.currentCoins = Number(s.coins);
+        if (session.initialCoins == null) session.initialCoins = Number(s.coins);
+      }
+
+      if (s?.id && s.status !== 'settled') registerStartedGame(s);
+      if (s?.status === 'settled') recordSettlement(s);
+
+      const target = Number(settings.targetGames) || 0;
+      if (!session.running) return;
+      if (target > 0 && session.settled >= target) return;
+
+      if (!s?.id || s.status === 'settled') {
+        if (target === 0 || session.started < target) await apiStartGame(s);
+        return;
+      }
+
+      if (s.pending_round || s.phase === 'wait') {
+        statusText = s.pending_round
+          ? `后台等待 drand #${s.pending_round}`
+          : '后台等待发牌/庄家补牌';
+        return;
+      }
+
+      if (s.phase === 'insurance') {
+        await apiMoveGame(s, 'noinsure', '庄家 A → 不买保险');
+        return;
+      }
+
+      if (s.phase === 'play') {
+        const d = decideFromState(s);
+        if (!d) {
+          statusText = '后台等待牌局状态完整';
+          return;
+        }
+        await apiMoveGame(s, d.action, d.reason);
+        return;
+      }
+
+      statusText = `后台等待状态：${s.status || ''}/${s.phase || ''}`;
+    } catch (e) {
+      lastStateError = String(e?.message || e);
+      statusText = `后台接口错误：${lastStateError}`;
+    } finally {
+      apiBusy = false;
+      render();
+    }
+  }
+
   function mainLoop() {
     if (!session.running) return;
+
+    if (settings.runMode === 'background') {
+      apiMainLoop();
+      return;
+    }
 
     const phase = phaseFromDOM();
 
@@ -503,6 +715,7 @@
 
   async function startAuto() {
     settings.bet = Number(ui.bet.value);
+    settings.runMode = ui.runMode.value === 'background' ? 'background' : 'visible';
     settings.targetGames = Math.max(0, parseInt(ui.target.value || '0', 10) || 0);
     settings.actionDelay = Math.max(120, Math.min(1500, parseInt(ui.delay.value || '350', 10) || 350));
     saveSettings();
@@ -525,11 +738,21 @@
     lastActionFingerprint = '';
     lastActionAt = 0;
     nextActionAt = 0;
+    apiBusy = false;
     statusText = '启动中，读取当前牌局…';
     recommendationText = '—';
     render();
 
-    await syncState();
+    await syncState(true);
+
+    if (settings.runMode === 'background') {
+      startBackgroundHeartbeat();
+      statusText = '后台稳定模式已启动';
+      mainLoop();
+      return;
+    }
+
+    stopBackgroundHeartbeat();
 
     // 若当前已经是已结算局，不把旧局计入本次；回到下注页后开始新的目标局数。
     if (lastState?.status === 'settled') {
@@ -543,6 +766,8 @@
   function stopAuto(reason = '手动停止') {
     session.running = false;
     awaitingStart = null;
+    apiBusy = false;
+    stopBackgroundHeartbeat();
     clearTimeout(loopTimer);
     statusText = reason;
     recommendationText = '—';
@@ -587,6 +812,7 @@
   function render() {
     if (!ui?.panel) return;
     ui.dot.classList.toggle('on', session.running);
+    ui.runMode.disabled = session.running;
     ui.toggle.textContent = session.running ? '停止自动' : '启动自动';
     ui.progress.textContent = `${session.settled}/${settings.targetGames || '∞'} 已结算 · ${session.started}/${settings.targetGames || '∞'} 已发起`;
     ui.status.textContent = statusText;
@@ -598,6 +824,10 @@
     ui.wagered.textContent = String(session.wagered);
     ui.rtp.textContent = session.wagered > 0 ? `${(session.returned / session.wagered * 100).toFixed(2)}%` : '—';
     ui.error.textContent = lastStateError ? `状态接口：${lastStateError}` : '';
+    ui.foot.textContent =
+      settings.runMode === 'background'
+        ? '后台稳定：直接使用站点正常 API；页面牌面可能不实时刷新'
+        : '前台可视：使用网页原生按钮，保留发牌/动画';
     ui.body.hidden = !!settings.collapsed;
     ui.collapse.textContent = settings.collapsed ? '展开' : '收起';
     renderHistory();
@@ -627,11 +857,17 @@
   panel.id = 'bj-auto-pro';
   panel.innerHTML = `
     <div class="head">
-      <div class="title"><span id="bja-dot"></span><b>Blackjack Auto Pro</b><small>v2</small></div>
+      <div class="title"><span id="bja-dot"></span><b>Blackjack Auto Pro</b><small>v2.1</small></div>
       <button id="bja-collapse" type="button">收起</button>
     </div>
     <div id="bja-body">
       <div class="controls">
+        <label>运行方式
+          <select id="bja-run-mode">
+            <option value="visible">前台可视</option>
+            <option value="background">后台稳定</option>
+          </select>
+        </label>
         <label>固定下注<select id="bja-bet"></select></label>
         <label>自动局数<input id="bja-target" type="number" min="0" step="1" title="0 = 无限"></label>
         <label>操作延迟<input id="bja-delay" type="number" min="120" max="1500" step="10"><span>ms</span></label>
@@ -663,7 +899,7 @@
         </table>
       </div>
       <div id="bja-error" class="error"></div>
-      <div class="foot">6 副牌 · S17 · DAS · 不买保险 · 使用网页原生按钮执行</div>
+      <div class="foot" id="bja-foot">6 副牌 · S17 · DAS · 不买保险</div>
     </div>`;
   document.body.appendChild(panel);
 
@@ -675,7 +911,7 @@
     #bj-auto-pro .title{display:flex;align-items:center;gap:7px} #bj-auto-pro .title small{color:#8d98a8}
     #bj-auto-pro #bja-dot{width:9px;height:9px;border-radius:50%;background:#6d7480} #bj-auto-pro #bja-dot.on{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.12)}
     #bj-auto-pro .head button,#bj-auto-pro .history-head button{border:1px solid rgba(255,255,255,.15);background:#2a303b;color:#e8edf3;border-radius:7px;padding:4px 8px;cursor:pointer}
-    #bj-auto-pro #bja-body{padding:11px} #bj-auto-pro .controls{display:grid;grid-template-columns:1fr 1fr 1fr;gap:8px}
+    #bj-auto-pro #bja-body{padding:11px} #bj-auto-pro .controls{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
     #bj-auto-pro label{display:flex;flex-direction:column;gap:5px;color:#aeb7c4;font-size:12px;position:relative}
     #bj-auto-pro input,#bj-auto-pro select{width:100%;height:32px;border-radius:8px;border:1px solid #404957;background:#11151b;color:#fff;padding:0 8px;outline:none}
     #bj-auto-pro label>span{position:absolute;right:8px;bottom:8px;color:#758092;font-size:10px}
@@ -703,6 +939,7 @@
     body: $('#bja-body', panel),
     dot: $('#bja-dot', panel),
     collapse: $('#bja-collapse', panel),
+    runMode: $('#bja-run-mode', panel),
     bet: $('#bja-bet', panel),
     target: $('#bja-target', panel),
     delay: $('#bja-delay', panel),
@@ -720,21 +957,32 @@
     export: $('#bja-export', panel),
     clear: $('#bja-clear', panel),
     error: $('#bja-error', panel),
+    foot: $('#bja-foot', panel),
   };
 
   for (const c of CHIPS) {
     const o = document.createElement('option');
     o.value = String(c); o.textContent = String(c); ui.bet.appendChild(o);
   }
+  ui.runMode.value = settings.runMode === 'background' ? 'background' : 'visible';
   ui.bet.value = String(settings.bet);
   ui.target.value = String(settings.targetGames);
   ui.delay.value = String(settings.actionDelay);
 
+  ui.runMode.addEventListener('change', () => {
+    if (session.running) {
+      ui.runMode.value = settings.runMode;
+      return;
+    }
+    settings.runMode = ui.runMode.value === 'background' ? 'background' : 'visible';
+    saveSettings();
+    render();
+  });
   ui.bet.addEventListener('change', () => { settings.bet = Number(ui.bet.value); saveSettings(); });
   ui.target.addEventListener('change', () => { settings.targetGames = Math.max(0, parseInt(ui.target.value || '0', 10) || 0); ui.target.value = String(settings.targetGames); saveSettings(); render(); });
   ui.delay.addEventListener('change', () => { settings.actionDelay = Math.max(120, Math.min(1500, parseInt(ui.delay.value || '350', 10) || 350)); ui.delay.value = String(settings.actionDelay); saveSettings(); });
   ui.toggle.addEventListener('click', () => session.running ? stopAuto('手动停止') : startAuto());
-  ui.sync.addEventListener('click', syncState);
+  ui.sync.addEventListener('click', () => syncState(true));
   ui.collapse.addEventListener('click', () => { settings.collapsed = !settings.collapsed; saveSettings(); render(); });
   ui.export.addEventListener('click', exportCSV);
   ui.clear.addEventListener('click', () => {
@@ -747,5 +995,5 @@
   syncTimer = setInterval(syncState, 650);
   render();
 
-  console.log('[BJ AUTO PRO] v2 已加载：所有下注/要牌/停牌/加倍/分牌均通过网页原生按钮执行。');
+  console.log('[BJ AUTO PRO] v2.1 已加载：支持前台可视与后台稳定 API 模式。');
 })();

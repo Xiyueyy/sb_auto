@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         sb.sb 消消乐 Auto
 // @namespace    https://sb.sb/
-// @version      2.0.1
-// @description  练习/正式计奖双模式：自动找可消除交换，使用网页原生棋盘操作保留动画，并记录成绩与收益。
+// @version      2.1.0
+// @description  练习/正式计奖双模式；支持前台可视原生操作与后台稳定 API 模式，自动选步并记录成绩与收益。
 // @match        https://sb.sb/games/match-3/*
 // @run-at       document-idle
 // @grant        none
@@ -16,6 +16,7 @@
   const BOARD_EL = document.querySelector('[data-m3-board]');
   const PRACTICE_BTN = document.querySelector('[data-m3-practice]');
   const FORMAL_BTN = document.querySelector('[data-m3-start]');
+  const CSRF_EL = document.querySelector('input[name="_csrf"]');
 
   if (!CONFIG_EL || !BOARD_EL) {
     console.warn('[M3 AUTO] 找不到消消乐配置或棋盘。');
@@ -40,6 +41,7 @@
 
   const settings = Object.assign({
     mode: 'practice',
+    runMode: 'visible',
     targetGames: 1,
     targetScore: 0,
     moveDelay: 480,
@@ -78,6 +80,10 @@
   let pollTimer = null;
   let tickTimer = null;
   let patchedCapture = false;
+  let apiBusy = false;
+  let lastApiRefreshAt = 0;
+  let heartbeatWorker = null;
+  let heartbeatUrl = null;
 
   function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -89,6 +95,77 @@
 
   function sleep(ms) {
     return new Promise(resolve => setTimeout(resolve, ms));
+  }
+
+  function newRequestID() {
+    return window.bbsGame?.newRequestID?.() ||
+      (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+  }
+
+  function csrfToken() {
+    return document.querySelector('input[name="_csrf"]')?.value || CSRF_EL?.value || '';
+  }
+
+  async function postAPI(url, data) {
+    const form = new FormData();
+    form.set('_csrf', csrfToken());
+    for (const [key, value] of Object.entries(data)) form.set(key, String(value));
+
+    const r = await fetch(url, {
+      method: 'POST',
+      body: form,
+      credentials: 'same-origin',
+      headers: { Accept: 'application/json' },
+    });
+
+    const body = await r.json();
+    if (!r.ok) throw new Error(body?.error || `HTTP ${r.status}`);
+    return body;
+  }
+
+  function startBackgroundHeartbeat() {
+    stopBackgroundHeartbeat();
+
+    const code = `
+      let timer = null;
+      onmessage = (event) => {
+        const data = event.data || {};
+        if (data.cmd === 'start') {
+          clearInterval(timer);
+          timer = setInterval(() => postMessage('tick'), Math.max(70, Number(data.ms) || 100));
+        } else if (data.cmd === 'stop') {
+          clearInterval(timer);
+          timer = null;
+        }
+      };
+    `;
+
+    try {
+      heartbeatUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
+      heartbeatWorker = new Worker(heartbeatUrl);
+    } catch (e) {
+      if (heartbeatUrl) URL.revokeObjectURL(heartbeatUrl);
+      heartbeatUrl = null;
+      heartbeatWorker = null;
+      console.warn('[M3 AUTO] Worker 心跳不可用，回退到页面定时器。', e);
+      return;
+    }
+    heartbeatWorker.onmessage = () => {
+      if (session.running && settings.runMode === 'background') tick();
+    };
+    heartbeatWorker.postMessage({ cmd: 'start', ms: 100 });
+  }
+
+  function stopBackgroundHeartbeat() {
+    if (heartbeatWorker) {
+      try { heartbeatWorker.postMessage({ cmd: 'stop' }); } catch {}
+      heartbeatWorker.terminate();
+      heartbeatWorker = null;
+    }
+    if (heartbeatUrl) {
+      URL.revokeObjectURL(heartbeatUrl);
+      heartbeatUrl = null;
+    }
   }
 
   function nowServer(s = state) {
@@ -470,7 +547,9 @@
     render();
   }
 
-  async function syncState() {
+  async function syncState(force = false) {
+    if (!force && session.running && settings.runMode === 'background') return;
+
     try {
       const s = await getState();
       stateError = '';
@@ -541,6 +620,194 @@
     btn.click();
     render();
     return true;
+  }
+
+  async function apiStartGame() {
+    if (!session.running || targetReached()) return false;
+    if (state?.status === 'active') return false;
+
+    if (settings.mode === 'formal') {
+      const check = formalPrecheck(state);
+      if (!check.ok) {
+        stopAuto(check.reason);
+        return false;
+      }
+    }
+
+    statusText = `后台接口启动第 ${session.started + 1} 局${modeLabel(settings.mode)}…`;
+    const res = await postAPI(CFG.start, {
+      request: newRequestID(),
+      practice: settings.mode === 'practice' ? 1 : 0,
+    });
+
+    if (res?.error) throw new Error(res.error);
+
+    state = res;
+    lastApiRefreshAt = Date.now();
+    if (res?.status === 'active') registerActiveGame(res);
+    if (res?.status === 'settled') recordSettlement(res);
+    render();
+    return true;
+  }
+
+  async function apiPlayMove() {
+    if (!session.running || !state || state.status !== 'active') return;
+
+    if (!modeMatchesState(state)) {
+      stopAuto(`牌局模式与脚本选择不一致：当前${modeLabel(stateMode(state))}，脚本${modeLabel(settings.mode)}`);
+      return;
+    }
+
+    if (targetHoldGameId === state.id) {
+      statusText =
+        `本局已达到目标分数 ${settings.targetScore}，已停止继续消除，等待本局结算后自动进入下一局`;
+      return;
+    }
+
+    if (
+      settings.mode === 'formal' &&
+      Number(settings.targetScore) > 0 &&
+      Number(state.score || 0) >= Number(settings.targetScore)
+    ) {
+      targetHoldGameId = state.id;
+      pendingMove = null;
+      statusText =
+        `本局已达到目标分数 ${settings.targetScore}（当前 ${state.score}），停止继续消除；等待结算后继续下一局`;
+      suggestionText = '本局达标，等待结算';
+      render();
+      return;
+    }
+
+    const nowS = Number(state.server_now || Date.now()) + Math.max(0, Date.now() - lastApiRefreshAt);
+
+    if (Number.isFinite(Number(state.start_at)) && nowS < Number(state.start_at)) {
+      statusText = `后台准备中：${Math.max(0, Math.ceil((Number(state.start_at) - nowS) / 1000))}s`;
+      return;
+    }
+
+    if (Number.isFinite(Number(state.deadline_at)) && nowS >= Number(state.deadline_at)) {
+      statusText = '后台等待本局结算…';
+      return;
+    }
+
+    if (Number.isFinite(Number(state.busy_until)) && nowS < Number(state.busy_until) + 25) {
+      statusText = '后台等待服务器消除结算…';
+      return;
+    }
+
+    if (Date.now() < nextMoveAt) return;
+
+    const board = boardFromString(state.board);
+    if (!board) {
+      statusText = '后台棋盘数据格式不正确，等待刷新…';
+      return;
+    }
+
+    const pick = pickMove(board);
+    if (!pick.best) {
+      suggestionText = '当前没有可消除交换，等待服务器重排';
+      statusText = '后台没有可用步，等待棋盘变化…';
+      return;
+    }
+
+    const m = pick.best;
+    suggestionText =
+      `共 ${pick.moves.length} 个可用步；选 (${m.from.r + 1},${m.from.c + 1}) ↔ ` +
+      `(${m.to.r + 1},${m.to.c + 1})，预计先消 ${m.clear} 个`;
+
+    pendingMove = {
+      gameId: state.id,
+      version: Number(state.version || 0),
+      boardBefore: String(state.board || ''),
+      scoreBefore: Number(state.score || 0),
+      move: m,
+      sentAt: Date.now(),
+      retries: 0,
+    };
+
+    const res = await postAPI(CFG.move, {
+      game: state.id,
+      move: newRequestID(),
+      expected: state.version,
+      fr: m.from.r,
+      fc: m.from.c,
+      tr: m.to.r,
+      tc: m.to.c,
+    });
+
+    if (res?.code === 'fast') {
+      state = res;
+      lastApiRefreshAt = Date.now();
+      pendingMove = null;
+      nextMoveAt = Date.now() + Math.max(80, Number(settings.moveDelay) || 250);
+      statusText = '后台发送过快，等待服务器允许下一步…';
+      return;
+    }
+
+    if (res?.error) {
+      if (res.board) state = res;
+      pendingMove = null;
+      if (res.code === 'over') {
+        statusText = '本局已结束，等待结算…';
+        return;
+      }
+      throw new Error(res.error);
+    }
+
+    recordMoveResult(res);
+    state = res;
+    lastApiRefreshAt = Date.now();
+
+    if (res?.status === 'settled') recordSettlement(res);
+    else registerActiveGame(res);
+  }
+
+  async function backgroundTick() {
+    if (!session.running || settings.runMode !== 'background' || apiBusy) return;
+
+    apiBusy = true;
+    try {
+      const now = Date.now();
+
+      // 后台定期同步一次服务器状态；每次 move/start 的响应也会直接更新 state。
+      if (!state || now - lastApiRefreshAt >= 450) {
+        const fresh = await getState();
+        recordMoveResult(fresh);
+        state = fresh;
+        lastApiRefreshAt = Date.now();
+
+        if (fresh?.status === 'settled') recordSettlement(fresh);
+        if (session.running && fresh?.status === 'active') {
+          if (!modeMatchesState(fresh)) {
+            stopAuto(`当前是${modeLabel(stateMode(fresh))}局，但脚本选择的是${modeLabel(settings.mode)}模式`);
+            return;
+          }
+          registerActiveGame(fresh);
+        }
+      }
+
+      if (!session.running) return;
+
+      if (state?.status === 'active') {
+        await apiPlayMove();
+        return;
+      }
+
+      if (state?.status === 'settled') {
+        if (targetReached()) return;
+        if (settings.autoRestart) await apiStartGame();
+        else statusText = '本局结束；自动续局已关闭';
+        return;
+      }
+
+      await apiStartGame();
+    } catch (e) {
+      stateError = String(e?.message || e);
+      statusText = `后台接口错误：${stateError}`;
+    } finally {
+      apiBusy = false;
+      render();
+    }
   }
 
   async function maybePlayMove() {
@@ -697,6 +964,7 @@
 
     ui.dot.classList.toggle('on', session.running);
     ui.mode.disabled = session.running;
+    ui.runMode.disabled = session.running;
     ui.toggle.textContent = session.running
       ? `停止${modeLabel(settings.mode)}自动`
       : `开始${modeLabel(settings.mode)}自动`;
@@ -739,6 +1007,10 @@
     }
 
     ui.error.textContent = stateError ? `状态接口：${stateError}` : '';
+    ui.foot.textContent =
+      settings.runMode === 'background'
+        ? '后台稳定：直接使用站点正常 start/move/state API；棋盘动画可能不实时刷新'
+        : '前台可视：使用网页原生 Pointer 事件，保留交换/消除动画';
     ui.body.hidden = !!settings.collapsed;
     ui.collapse.textContent = settings.collapsed ? '展开' : '收起';
 
@@ -769,13 +1041,14 @@
 
   async function startAuto() {
     settings.mode = ui.mode.value === 'formal' ? 'formal' : 'practice';
+    settings.runMode = ui.runMode.value === 'background' ? 'background' : 'visible';
     settings.targetGames = Math.max(0, parseInt(ui.target.value || '0', 10) || 0);
     settings.targetScore = Math.max(0, parseInt(ui.targetScore.value || '0', 10) || 0);
     settings.moveDelay = Math.max(120, Math.min(1200, parseInt(ui.delay.value || '480', 10) || 480));
     settings.autoRestart = ui.restart.checked;
     saveSettings();
 
-    await syncState();
+    await syncState(true);
 
     if (settings.mode === 'formal') {
       const check = formalPrecheck(state);
@@ -809,10 +1082,18 @@
 
     resetSessionStats();
     session.running = true;
+    apiBusy = false;
     statusText = '正在检查当前牌局…';
     render();
 
-    await syncState();
+    await syncState(true);
+
+    if (settings.runMode === 'background') {
+      lastApiRefreshAt = Date.now();
+      startBackgroundHeartbeat();
+    } else {
+      stopBackgroundHeartbeat();
+    }
 
     if (state?.status === 'active') {
       if (!modeMatchesState(state)) {
@@ -823,7 +1104,8 @@
       registerActiveGame(state);
       statusText = `接管当前${modeLabel(settings.mode)}局`;
     } else {
-      startGameIfNeeded();
+      if (settings.runMode === 'background') await apiStartGame();
+      else startGameIfNeeded();
     }
 
     render();
@@ -833,6 +1115,8 @@
     session.running = false;
     pendingMove = null;
     targetHoldGameId = null;
+    apiBusy = false;
+    stopBackgroundHeartbeat();
     statusText = reason;
     suggestionText = '—';
     render();
@@ -841,6 +1125,11 @@
   async function tick() {
     try {
       if (!session.running) return;
+
+      if (settings.runMode === 'background') {
+        await backgroundTick();
+        return;
+      }
 
       if (!state) {
         statusText = '等待状态数据…';
@@ -878,7 +1167,7 @@
       <div class="m3a-title">
         <span id="m3a-dot"></span>
         <b>消消乐 Auto</b>
-        <small>v2</small>
+        <small>v2.1</small>
       </div>
       <button id="m3a-collapse" type="button">收起</button>
     </div>
@@ -891,10 +1180,18 @@
 
       <div class="m3a-controls">
         <label>
-          模式
+          游戏模式
           <select id="m3a-mode">
             <option value="practice">练习</option>
             <option value="formal">正式计奖</option>
+          </select>
+        </label>
+
+        <label>
+          运行方式
+          <select id="m3a-run-mode">
+            <option value="visible">前台可视</option>
+            <option value="background">后台稳定</option>
           </select>
         </label>
 
@@ -918,7 +1215,7 @@
 
         <label class="m3a-check">
           <input id="m3a-restart" type="checkbox">
-          <span>自动续练下一局</span>
+          <span>自动续下一局</span>
         </label>
       </div>
 
@@ -960,7 +1257,7 @@
       </div>
 
       <div id="m3a-error" class="m3a-error"></div>
-      <div class="m3a-foot">8×8 · 练习/正式计奖双模式 · 原生 Pointer 事件操作</div>
+      <div class="m3a-foot" id="m3a-foot">8×8 · 练习/正式计奖双模式</div>
     </div>
   `;
 
@@ -1084,6 +1381,7 @@
     dot: $('#m3a-dot', panel),
     collapse: $('#m3a-collapse', panel),
     mode: $('#m3a-mode', panel),
+    runMode: $('#m3a-run-mode', panel),
     modeNote: $('#m3a-mode-note', panel),
     modeTitle: $('#m3a-mode-title', panel),
     modeDesc: $('#m3a-mode-desc', panel),
@@ -1107,9 +1405,11 @@
     history: $('#m3a-history', panel),
     clear: $('#m3a-clear', panel),
     error: $('#m3a-error', panel),
+    foot: $('#m3a-foot', panel),
   };
 
   ui.mode.value = settings.mode === 'formal' ? 'formal' : 'practice';
+  ui.runMode.value = settings.runMode === 'background' ? 'background' : 'visible';
   ui.target.value = String(settings.targetGames);
   ui.targetScore.value = String(settings.targetScore || 0);
   ui.delay.value = String(settings.moveDelay);
@@ -1123,6 +1423,17 @@
     settings.mode = ui.mode.value === 'formal' ? 'formal' : 'practice';
     saveSettings();
     statusText = `已切换到${modeLabel(settings.mode)}模式`;
+    render();
+  });
+
+  ui.runMode.addEventListener('change', () => {
+    if (session.running) {
+      ui.runMode.value = settings.runMode;
+      return;
+    }
+    settings.runMode = ui.runMode.value === 'background' ? 'background' : 'visible';
+    saveSettings();
+    statusText = settings.runMode === 'background' ? '已切换到后台稳定模式' : '已切换到前台可视模式';
     render();
   });
 
@@ -1156,7 +1467,7 @@
     else startAuto();
   });
 
-  ui.sync.addEventListener('click', syncState);
+  ui.sync.addEventListener('click', () => syncState(true));
 
   ui.collapse.addEventListener('click', () => {
     settings.collapsed = !settings.collapsed;
@@ -1184,5 +1495,5 @@
   tickTimer = setInterval(tick, 90);
   render();
 
-  console.log('[M3 AUTO] v2 已加载：练习/正式计奖双模式，使用网页原生棋盘 Pointer 事件。');
+  console.log('[M3 AUTO] v2.1 已加载：练习/正式计奖 + 前台可视/后台稳定双运行方式。');
 })();
