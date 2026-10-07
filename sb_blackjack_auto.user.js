@@ -1,34 +1,161 @@
 // ==UserScript==
 // @name         sb.sb Blackjack Auto Pro
 // @namespace    https://sb.sb/
-// @version      2.1.0
-// @description  自动下注 + 基本策略；支持前台可视原生操作与后台稳定 API 模式，带局数控制、会话统计和本地历史记录。
+// @version      3.0.0
+// @description  sb.sb 黑杰克自动打牌：精确基本策略、前台可视 / 后台稳定 / 仅提示三种模式，止盈止损、超时保护、会话统计与本地历史。
+// @author       Xiyueyy
 // @match        https://sb.sb/games/blackjack/*
 // @run-at       document-idle
 // @grant        none
+// @homepageURL  https://github.com/Xiyueyy/sb_auto
+// @downloadURL  https://raw.githubusercontent.com/Xiyueyy/sb_auto/main/sb_blackjack_auto.user.js
+// @updateURL    https://raw.githubusercontent.com/Xiyueyy/sb_auto/main/sb_blackjack_auto.user.js
 // ==/UserScript==
 
 (() => {
   'use strict';
 
+  const VERSION = '3.0.0';
   const root = document.querySelector('[data-bj]');
   const configEl = document.getElementById('blackjack-config');
-  const csrfEl = document.querySelector('input[name="_csrf"]');
   if (!root || !configEl) {
-    console.warn('[BJ AUTO PRO] 找不到游戏区域或配置。');
+    console.warn('[BJ AUTO] 找不到游戏区域或配置。');
     return;
   }
 
-  const CFG = JSON.parse(configEl.textContent || '{}');
-  const CHIPS = Array.isArray(CFG.chips) ? CFG.chips : [10, 50, 100, 500, 1000];
-  const SETTINGS_KEY = 'sb-bj-auto-pro-settings-v2';
-  const HISTORY_KEY = 'sb-bj-auto-pro-history-v2';
-  const MAX_HISTORY = 100;
+  let CFG = {};
+  try { CFG = JSON.parse(configEl.textContent || '{}'); } catch {}
+  const CHIPS = Array.isArray(CFG.chips) && CFG.chips.length ? CFG.chips.map(Number) : [10, 50, 100, 500, 1000];
+  const ENDPOINT = {
+    start: CFG.Start || '/games/blackjack/start/',
+    move: CFG.Move || '/games/blackjack/move/',
+    state: CFG.State || '/games/blackjack/state/',
+  };
+
+  /* ------------------------------------------------------------------ *
+   * 规则与策略
+   * 站点规则：6 副牌、每局重新洗牌、无暗牌、庄家软 17 停、BJ 3:2、可加倍任意两张、
+   * 分牌后可加倍、最多 4 手、分 A 只补一张、庄家 BJ 只输原注（OBO）。
+   * 下表是该规则下的总点数基本策略，已用逐手精确期望值校验（540 种起手 0 处偏差）。
+   * 每格：H 要 / S 停 / D 能加倍就加倍否则要 / Ds 能加倍就加倍否则停 / P 分。
+   * 庄家列顺序：2 3 4 5 6 7 8 9 10 A
+   * ------------------------------------------------------------------ */
+  const UP = [2, 3, 4, 5, 6, 7, 8, 9, 10, 11];
+  const row = (s) => s.trim().split(/\s+/);
+  const HARD = {
+    8: row('H H H H H H H H H H'),
+    9: row('H D D D D H H H H H'),
+    10: row('D D D D D D D D H H'),
+    11: row('D D D D D D D D D H'),
+    12: row('H H S S S H H H H H'),
+    13: row('S S S S S H H H H H'),
+    14: row('S S S S S H H H H H'),
+    15: row('S S S S S H H H H H'),
+    16: row('S S S S S H H H H H'),
+    17: row('S S S S S S S S S S'),
+  };
+  const SOFT = {
+    13: row('H H H D D H H H H H'),
+    14: row('H H H D D H H H H H'),
+    15: row('H H D D D H H H H H'),
+    16: row('H H D D D H H H H H'),
+    17: row('H D D D D H H H H H'),
+    18: row('S Ds Ds Ds Ds S S H H H'),
+    19: row('S S S S S S S S S S'),
+  };
+  const PAIRS = {
+    11: row('P P P P P P P P P P'),
+    10: row('S S S S S S S S S S'),
+    9: row('P P P P P S P P S S'),
+    8: row('P P P P P P P P P P'),
+    7: row('P P P P P P H H H H'),
+    6: row('P P P P P H H H H H'),
+    5: row('D D D D D D D D H H'),
+    4: row('H H H P P H H H H H'),
+    3: row('P P P P P P H H H H'),
+    2: row('P P P P P P H H H H'),
+  };
+
   const SUITS = ['♠', '♥', '♦', '♣'];
   const RANKS = ['A', '2', '3', '4', '5', '6', '7', '8', '9', '10', 'J', 'Q', 'K'];
+  const rankOf = (id) => RANKS[((Number(id) % 13) + 13) % 13];
+  const labelOf = (id) => {
+    const n = Number(id);
+    return Number.isInteger(n) && n >= 0 && n < 52 ? SUITS[Math.floor(n / 13)] + RANKS[n % 13] : '?';
+  };
+  const pointOf = (rank) => (rank === 'A' ? 11 : ['10', 'J', 'Q', 'K'].includes(rank) ? 10 : Number(rank));
+  const upText = (v) => (v === 11 ? 'A' : String(v));
 
-  const $ = (sel, base = document) => base.querySelector(sel);
-  const $$ = (sel, base = document) => [...base.querySelectorAll(sel)];
+  function handInfo(ranks) {
+    let total = 0;
+    let aces = 0;
+    for (const r of ranks) {
+      const v = pointOf(r);
+      total += v;
+      if (v === 11) aces++;
+    }
+    while (total > 21 && aces > 0) { total -= 10; aces--; }
+    return { total, soft: aces > 0 };
+  }
+
+  const ACTION_TEXT = { hit: '要牌', stand: '停牌', double: '加倍', split: '分牌', noinsure: '不保险' };
+
+  /** ranks: 玩家手牌点名数组；up: 庄家明牌点名；can: {hit,stand,double,split} */
+  function decide(ranks, up, can) {
+    const u = pointOf(up);
+    const col = UP.indexOf(u);
+    const info = handInfo(ranks);
+    const vs = ` 对 ${upText(u)}`;
+
+    const pick = (action, why) => {
+      // 站点此刻不允许的动作退化为最接近的合法动作。
+      if (!can[action]) action = action === 'stand' || !can.hit ? 'stand' : 'hit';
+      return { action, reason: `${why} → ${ACTION_TEXT[action]}` };
+    };
+
+    if (ranks.length === 2 && can.split && pointOf(ranks[0]) === pointOf(ranks[1])) {
+      if (PAIRS[pointOf(ranks[0])][col] === 'P') return pick('split', `${ranks[0]}${ranks[1]}${vs}`);
+    }
+
+    let code;
+    let label;
+    if (info.soft && info.total >= 13) {
+      code = SOFT[Math.min(info.total, 19)][col];
+      label = `软 ${info.total}`;
+    } else if (info.soft) {
+      code = 'H';
+      label = `软 ${info.total}`;
+    } else {
+      code = HARD[Math.max(8, Math.min(info.total, 17))][col];
+      label = `硬 ${info.total}`;
+    }
+
+    if (code === 'D') return pick(can.double ? 'double' : 'hit', label + vs);
+    if (code === 'Ds') return pick(can.double ? 'double' : 'stand', label + vs);
+    return pick(code === 'S' ? 'stand' : 'hit', label + vs);
+  }
+
+  function decideFromState(s) {
+    const hand = s?.hands?.[s.active];
+    const upId = s?.dealer?.[0];
+    if (!hand || !hand.cards?.length || upId == null) return null;
+    const can = {
+      hit: !!s.can?.Hit,
+      stand: !!s.can?.Stand,
+      double: !!s.can?.Double,
+      split: !!s.can?.Split,
+    };
+    if (!can.hit && !can.stand) return null;
+    return decide(hand.cards.map(rankOf), rankOf(upId), can);
+  }
+
+  /* ------------------------------------------------------------------ *
+   * 设置 / 历史
+   * ------------------------------------------------------------------ */
+  const SETTINGS_KEY = 'sb-bj-auto-pro-settings-v3';
+  const HISTORY_KEY = 'sb-bj-auto-pro-history-v3';
+  const LEGACY_HISTORY_KEY = 'sb-bj-auto-pro-history-v2';
+  const MAX_HISTORY = 300;
 
   function loadJSON(key, fallback) {
     try {
@@ -39,410 +166,174 @@
     }
   }
 
+  const legacy = loadJSON('sb-bj-auto-pro-settings-v2', {});
   const settings = Object.assign({
-    bet: 10,
-    runMode: 'visible',
-    targetGames: 3,
-    actionDelay: 350,
+    mode: legacy.runMode === 'background' ? 'background' : 'visible', // visible | background | hint
+    bet: Number(legacy.bet) || CHIPS[0],
+    targetGames: Number.isFinite(Number(legacy.targetGames)) ? Number(legacy.targetGames) : 20,
+    takeProfit: 0,
+    stopLoss: 0,
+    minBalance: 0,
+    actionDelay: Number(legacy.actionDelay) || 350,
     keepHistory: true,
     collapsed: false,
-  }, loadJSON(SETTINGS_KEY, {}));
-
+    tab: 'run',
+    x: null,
+    y: null,
+  }, loadJSON(SETTINGS_KEY, null) ?? { collapsed: window.innerWidth < 520 });
   if (!CHIPS.includes(Number(settings.bet))) settings.bet = CHIPS[0];
+  if (!['visible', 'background', 'hint'].includes(settings.mode)) settings.mode = 'visible';
 
-  let history = loadJSON(HISTORY_KEY, []);
-  if (!Array.isArray(history)) history = [];
+  let history = loadJSON(HISTORY_KEY, null);
+  if (!Array.isArray(history)) {
+    history = loadJSON(LEGACY_HISTORY_KEY, []);
+    if (!Array.isArray(history)) history = [];
+  }
 
+  const saveSettings = () => localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  const saveHistory = () => {
+    if (settings.keepHistory) localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, MAX_HISTORY)));
+  };
+
+  /* ------------------------------------------------------------------ *
+   * 会话状态
+   * ------------------------------------------------------------------ */
   const session = {
     running: false,
+    stopAfterCurrent: false,
     started: 0,
     settled: 0,
     wins: 0,
     losses: 0,
     pushes: 0,
+    blackjacks: 0,
+    doubles: 0,
+    splits: 0,
+    busts: 0,
     wagered: 0,
     returned: 0,
     net: 0,
-    initialCoins: null,
-    currentCoins: null,
+    peak: 0,
+    trough: 0,
+    curve: [0],
     gameIds: new Set(),
     settledIds: new Set(),
-    actionsByGame: new Map(),
+    actions: new Map(),
   };
 
   let lastState = null;
-  let lastStateError = '';
-  let awaitingStart = null;
-  let lastActionFingerprint = '';
-  let lastActionAt = 0;
-  let nextActionAt = 0;
-  let loopTimer = null;
-  let syncTimer = null;
+  let coins = null;
+  let clockSkew = 0; // server_now - Date.now()
   let statusText = '准备就绪';
-  let recommendationText = '—';
-  let apiBusy = false;
-  let heartbeatWorker = null;
-  let heartbeatUrl = null;
+  let adviceText = '—';
+  let errorText = '';
+  let busy = false;
+  let lastKey = '';
+  let lastKeyAt = 0;
+  let failStreak = 0;
+  let awaitingStart = null;
+  let nextVisibleAt = 0;
+  let loopTimer = null;
+  let worker = null;
+  let workerUrl = null;
 
-  function saveSettings() {
-    localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
+  const serverNow = () => Date.now() + clockSkew;
+  const csrf = () => document.querySelector('input[name="_csrf"]')?.value || '';
+  const requestId = () =>
+    window.bbsGame?.newRequestID?.() ||
+    (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
+
+  function absorb(s) {
+    if (!s || typeof s !== 'object') return s;
+    if (Number.isFinite(Number(s.server_now))) clockSkew = Number(s.server_now) - Date.now();
+    if (s.coins != null && Number.isFinite(Number(s.coins))) coins = Number(s.coins);
+    if (s.id) lastState = s;
+    return s;
   }
 
-  function saveHistory() {
-    if (!settings.keepHistory) return;
-    localStorage.setItem(HISTORY_KEY, JSON.stringify(history.slice(0, MAX_HISTORY)));
+  /* ------------------------------------------------------------------ *
+   * 网络
+   * ------------------------------------------------------------------ */
+  async function getState() {
+    const r = await fetch(ENDPOINT.state, {
+      credentials: 'same-origin',
+      cache: 'no-store',
+      headers: { Accept: 'application/json' },
+    });
+    if (!r.ok) throw new Error(`state HTTP ${r.status}`);
+    return absorb(await r.json());
   }
 
-  function sleepLoop(ms = 150) {
-    clearTimeout(loopTimer);
-    loopTimer = setTimeout(mainLoop, ms);
-  }
-
-  function newRequestID() {
-    return window.bbsGame?.newRequestID?.() ||
-      (crypto.randomUUID ? crypto.randomUUID() : `${Date.now()}-${Math.random().toString(16).slice(2)}`);
-  }
-
-  function csrfToken() {
-    return document.querySelector('input[name="_csrf"]')?.value || csrfEl?.value || '';
-  }
-
-  function startBackgroundHeartbeat() {
-    stopBackgroundHeartbeat();
-
-    const code = `
-      let timer = null;
-      onmessage = (event) => {
-        const data = event.data || {};
-        if (data.cmd === 'start') {
-          clearInterval(timer);
-          timer = setInterval(() => postMessage('tick'), Math.max(80, Number(data.ms) || 180));
-        } else if (data.cmd === 'stop') {
-          clearInterval(timer);
-          timer = null;
-        }
-      };
-    `;
-
-    try {
-      heartbeatUrl = URL.createObjectURL(new Blob([code], { type: 'text/javascript' }));
-      heartbeatWorker = new Worker(heartbeatUrl);
-    } catch (e) {
-      if (heartbeatUrl) URL.revokeObjectURL(heartbeatUrl);
-      heartbeatUrl = null;
-      heartbeatWorker = null;
-      console.warn('[BJ AUTO PRO] Worker 心跳不可用，回退到页面定时器。', e);
-      return;
-    }
-    heartbeatWorker.onmessage = () => {
-      if (session.running && settings.runMode === 'background') mainLoop();
-    };
-    heartbeatWorker.postMessage({ cmd: 'start', ms: 180 });
-  }
-
-  function stopBackgroundHeartbeat() {
-    if (heartbeatWorker) {
-      try { heartbeatWorker.postMessage({ cmd: 'stop' }); } catch {}
-      heartbeatWorker.terminate();
-      heartbeatWorker = null;
-    }
-    if (heartbeatUrl) {
-      URL.revokeObjectURL(heartbeatUrl);
-      heartbeatUrl = null;
-    }
-  }
-
-  async function postAPI(url, data) {
+  async function post(url, data) {
     const form = new FormData();
-    form.set('_csrf', csrfToken());
-    for (const [key, value] of Object.entries(data)) form.set(key, String(value));
-
+    form.set('_csrf', csrf());
+    for (const [k, v] of Object.entries(data)) form.set(k, String(v));
     const r = await fetch(url, {
       method: 'POST',
       body: form,
       credentials: 'same-origin',
       headers: { Accept: 'application/json' },
     });
-
-    const body = await r.json();
-    if (!r.ok || (body?.error && !body?.id)) {
-      throw new Error(body?.error || `HTTP ${r.status}`);
+    let body = null;
+    try { body = await r.json(); } catch {}
+    if (body) absorb(body);
+    if ((!r.ok || body?.error) && !body?.id) {
+      const err = new Error(body?.error || `HTTP ${r.status}`);
+      err.code = body?.code;
+      throw err;
     }
     return body;
   }
 
-  function isVisible(el) {
-    if (!el) return false;
-    if (el.hidden || el.closest('[hidden]')) return false;
-    const style = getComputedStyle(el);
-    return style.display !== 'none' && style.visibility !== 'hidden';
-  }
-
-  function actionButton(action) {
-    return root.querySelector(`[data-bj-act="${action}"]`);
-  }
-
-  function actionAvailable(action) {
-    const b = actionButton(action);
-    return !!b && isVisible(b) && !b.disabled;
-  }
-
-  function clickNative(el, why = '') {
-    if (!el || el.disabled || !isVisible(el)) return false;
-    const now = Date.now();
-    if (now < nextActionAt) return false;
-    nextActionAt = now + Math.max(120, Number(settings.actionDelay) || 350);
-    if (why) statusText = why;
-    el.click();
-    render();
-    return true;
-  }
-
-  function parseCardLabel(label) {
-    const m = String(label || '').trim().match(/^([♠♥♦♣])(A|10|[2-9]|J|Q|K)$/);
-    if (!m) return null;
-    return { suit: m[1], rank: m[2], label: m[0] };
-  }
-
-  function valueFromRank(rank) {
-    if (rank === 'A') return 11;
-    if (['10', 'J', 'Q', 'K'].includes(rank)) return 10;
-    return Number(rank);
-  }
-
-  function cardLabelFromId(id) {
-    const n = Number(id);
-    if (!Number.isFinite(n) || n < 0 || n > 51) return '?';
-    return SUITS[Math.floor(n / 13)] + RANKS[n % 13];
-  }
-
-  function handInfo(cards) {
-    let total = 0;
-    let softAces = 0;
-    for (const c of cards) {
-      const v = valueFromRank(c.rank);
-      total += v;
-      if (v === 11) softAces++;
-    }
-    while (total > 21 && softAces > 0) {
-      total -= 10;
-      softAces--;
-    }
-    return { total, soft: softAces > 0 };
-  }
-
-  function dealerUpCard() {
-    const labels = $$('[data-bj-dealer] .bj-card[aria-label]', root)
-      .map(el => parseCardLabel(el.getAttribute('aria-label')))
-      .filter(Boolean);
-    return labels[0] || null;
-  }
-
-  function activeHandElement() {
-    const hands = $$('.bj-hand', root);
-    if (!hands.length) return null;
-    return hands.find(h => h.classList.contains('is-active')) || hands[0];
-  }
-
-  function activeHandCards() {
-    const hand = activeHandElement();
-    if (!hand) return [];
-    return $$('.bj-card[aria-label]', hand)
-      .map(el => parseCardLabel(el.getAttribute('aria-label')))
-      .filter(Boolean);
-  }
-
-  function dealerText(v) {
-    return v === 11 ? 'A' : String(v);
-  }
-
-  // 6D / S17 / DAS / no surrender / no insurance
-  function decide(cards, dealerCard, canOverride = null) {
-    const dealer = valueFromRank(dealerCard.rank);
-    const can = canOverride || {
-      hit: actionAvailable('hit'),
-      stand: actionAvailable('stand'),
-      double: actionAvailable('double'),
-      split: actionAvailable('split'),
-    };
-
-    // 对子：这里按“点数相同”处理，所以 10/J/Q/K 视为同类 10 点牌。
-    if (cards.length === 2 && can.split) {
-      const a = valueFromRank(cards[0].rank);
-      const b = valueFromRank(cards[1].rank);
-      if (a === b) {
-        let split = false;
-        if (a === 11 || a === 8) split = true;                         // AA / 88
-        else if (a === 9) split = [2,3,4,5,6,8,9].includes(dealer);    // 99
-        else if (a === 7) split = dealer >= 2 && dealer <= 7;          // 77
-        else if (a === 6) split = dealer >= 2 && dealer <= 6;          // 66 DAS
-        else if (a === 4) split = dealer === 5 || dealer === 6;        // 44 DAS
-        else if (a === 2 || a === 3) split = dealer >= 2 && dealer <= 7;
-        // 55 当硬 10；TT 永不分。
-        if (split) {
-          return { action: 'split', reason: `${cards[0].rank}${cards[1].rank} vs ${dealerText(dealer)} → 分牌` };
-        }
-      }
-    }
-
-    const h = handInfo(cards);
-    const total = h.total;
-
-    if (h.soft) {
-      if (total <= 12) return { action: 'hit', reason: `软 ${total} vs ${dealerText(dealer)} → 要牌` };
-      if (total === 13 || total === 14) {
-        if (dealer >= 5 && dealer <= 6 && can.double) return { action: 'double', reason: `软 ${total} vs ${dealerText(dealer)} → 加倍` };
-        return { action: 'hit', reason: `软 ${total} vs ${dealerText(dealer)} → 要牌` };
-      }
-      if (total === 15 || total === 16) {
-        if (dealer >= 4 && dealer <= 6 && can.double) return { action: 'double', reason: `软 ${total} vs ${dealerText(dealer)} → 加倍` };
-        return { action: 'hit', reason: `软 ${total} vs ${dealerText(dealer)} → 要牌` };
-      }
-      if (total === 17) {
-        if (dealer >= 3 && dealer <= 6 && can.double) return { action: 'double', reason: `软 17 vs ${dealerText(dealer)} → 加倍` };
-        return { action: 'hit', reason: `软 17 vs ${dealerText(dealer)} → 要牌` };
-      }
-      if (total === 18) {
-        if (dealer >= 3 && dealer <= 6 && can.double) return { action: 'double', reason: `软 18 vs ${dealerText(dealer)} → 加倍` };
-        if ([2,7,8].includes(dealer) || (dealer >= 3 && dealer <= 6)) return { action: 'stand', reason: `软 18 vs ${dealerText(dealer)} → 停牌` };
-        return { action: 'hit', reason: `软 18 vs ${dealerText(dealer)} → 要牌` };
-      }
-      return { action: 'stand', reason: `软 ${total} vs ${dealerText(dealer)} → 停牌` };
-    }
-
-    if (total <= 8) return { action: 'hit', reason: `硬 ${total} vs ${dealerText(dealer)} → 要牌` };
-    if (total === 9) {
-      if (dealer >= 3 && dealer <= 6 && can.double) return { action: 'double', reason: `硬 9 vs ${dealerText(dealer)} → 加倍` };
-      return { action: 'hit', reason: `硬 9 vs ${dealerText(dealer)} → 要牌` };
-    }
-    if (total === 10) {
-      if (dealer >= 2 && dealer <= 9 && can.double) return { action: 'double', reason: `硬 10 vs ${dealerText(dealer)} → 加倍` };
-      return { action: 'hit', reason: `硬 10 vs ${dealerText(dealer)} → 要牌` };
-    }
-    if (total === 11) {
-      if (dealer >= 2 && dealer <= 10 && can.double) return { action: 'double', reason: `硬 11 vs ${dealerText(dealer)} → 加倍` };
-      return { action: 'hit', reason: `硬 11 vs ${dealerText(dealer)} → 要牌` };
-    }
-    if (total === 12) {
-      const stand = dealer >= 4 && dealer <= 6;
-      return { action: stand ? 'stand' : 'hit', reason: `硬 12 vs ${dealerText(dealer)} → ${stand ? '停牌' : '要牌'}` };
-    }
-    if (total >= 13 && total <= 16) {
-      const stand = dealer >= 2 && dealer <= 6;
-      return { action: stand ? 'stand' : 'hit', reason: `硬 ${total} vs ${dealerText(dealer)} → ${stand ? '停牌' : '要牌'}` };
-    }
-    return { action: 'stand', reason: `硬 ${total} vs ${dealerText(dealer)} → 停牌` };
-  }
-
-  function cardObjectFromId(id) {
-    const n = Number(id);
-    return {
-      rank: RANKS[((n % 13) + 13) % 13],
-      label: cardLabelFromId(n),
-    };
-  }
-
-  function decideFromState(s) {
-    const hand = s?.hands?.[s.active];
-    const dealerId = s?.dealer?.[0];
-    if (!hand || dealerId == null) return null;
-
-    const cards = (hand.cards || []).map(cardObjectFromId);
-    const dealerCard = cardObjectFromId(dealerId);
-    const can = {
-      hit: !!s?.can?.Hit,
-      stand: !!s?.can?.Stand,
-      double: !!s?.can?.Double,
-      split: !!s?.can?.Split,
-    };
-
-    return decide(cards, dealerCard, can);
-  }
-
-  function phaseFromDOM() {
-    if (isVisible($('[data-bj-wait]', root))) return 'wait';
-    if (isVisible($('[data-bj-ins-row]', root))) return 'insurance';
-    if (isVisible($('[data-bj-play-row]', root))) return 'play';
-    if (isVisible($('[data-bj-again-row]', root))) return 'settled';
-    if (isVisible($('[data-bj-bet-row]', root))) return 'bet';
-    return 'transition';
-  }
-
-  function fingerprint(action, cards, dealer) {
-    const active = $$('.bj-hand', root).indexOf(activeHandElement());
-    return [
-      phaseFromDOM(),
-      active,
-      dealer?.label || '?',
-      cards.map(c => c.label).join(','),
-      action,
-    ].join('|');
-  }
-
-  function logAction(action, reason) {
-    const id = lastState?.id;
-    if (!id) return;
-    if (!session.actionsByGame.has(id)) session.actionsByGame.set(id, []);
-    session.actionsByGame.get(id).push({
-      at: Date.now(),
-      action,
-      reason,
-    });
-  }
-
-  function clickAction(action, reason, cards = [], dealer = null) {
-    const b = actionButton(action);
-    if (!b || b.disabled || !isVisible(b)) return false;
-
-    const fp = fingerprint(action, cards, dealer);
-    const now = Date.now();
-    if (fp === lastActionFingerprint && now - lastActionAt < 1800) return false;
-
-    if (now < nextActionAt) return false;
-    lastActionFingerprint = fp;
-    lastActionAt = now;
-    recommendationText = reason;
-    logAction(action, reason);
-    return clickNative(b, `执行：${reason}`);
-  }
-
-  async function getState() {
-    if (!CFG.State) return null;
-    const r = await fetch(CFG.State, {
-      credentials: 'same-origin',
-      cache: 'no-store',
-      headers: { Accept: 'application/json' },
-    });
-    if (!r.ok) throw new Error(`state HTTP ${r.status}`);
-    return r.json();
-  }
-
-  function paidFromState(s) {
+  /* ------------------------------------------------------------------ *
+   * 结算与统计
+   * ------------------------------------------------------------------ */
+  function paidOf(s) {
     if (Number.isFinite(Number(s.paid))) return Number(s.paid);
-    let paid = 0;
-    for (const h of s.hands || []) paid += Number(h.paid || 0);
-    return paid;
+    return (s.hands || []).reduce((sum, h) => sum + Number(h.paid || 0), 0);
+  }
+
+  function logAction(id, action, reason) {
+    if (!id) return;
+    if (!session.actions.has(id)) session.actions.set(id, []);
+    session.actions.get(id).push({ at: Date.now(), action, reason });
+    if (action === 'double') session.doubles++;
+    if (action === 'split') session.splits++;
+  }
+
+  function registerStarted(s) {
+    if (!s?.id || session.gameIds.has(s.id)) return;
+    session.gameIds.add(s.id);
+    session.started++;
+    if (!session.actions.has(s.id)) session.actions.set(s.id, []);
+    awaitingStart = null;
   }
 
   function recordSettlement(s) {
-    if (!s?.id || session.settledIds.has(s.id)) return;
-    if (!session.gameIds.has(s.id)) return;
-
+    if (!s?.id || s.status !== 'settled') return;
+    if (session.settledIds.has(s.id) || !session.gameIds.has(s.id)) return;
     session.settledIds.add(s.id);
     session.settled++;
 
     const staked = Number(s.staked || 0);
-    const paid = paidFromState(s);
+    const paid = paidOf(s);
     const net = paid - staked;
-
     session.wagered += staked;
     session.returned += paid;
     session.net += net;
+    session.peak = Math.max(session.peak, session.net);
+    session.trough = Math.min(session.trough, session.net);
+    session.curve.push(session.net);
+    if (session.curve.length > 400) session.curve.splice(1, session.curve.length - 400);
     if (net > 0) session.wins++;
     else if (net < 0) session.losses++;
     else session.pushes++;
 
-    const rec = {
+    const hands = s.hands || [];
+    if (hands.length === 1 && hands[0].cards?.length === 2 && handInfo(hands[0].cards.map(rankOf)).total === 21) session.blackjacks++;
+    session.busts += hands.filter((h) => Number(h.total) > 21).length;
+
+    history.unshift({
       ts: Date.now(),
       id: s.id,
       base: Number(s.base || settings.bet || 0),
@@ -450,550 +341,763 @@
       paid,
       net,
       coins: Number(s.coins || 0),
-      dealer: (s.dealer || []).map(cardLabelFromId),
+      dealer: (s.dealer || []).map(labelOf),
       dealerTotal: s.dealer_total,
-      hands: (s.hands || []).map(h => ({
-        cards: (h.cards || []).map(cardLabelFromId),
+      hands: hands.map((h) => ({
+        cards: (h.cards || []).map(labelOf),
         total: h.total,
         bet: h.bet,
         result: h.result || '',
         paid: Number(h.paid || 0),
       })),
-      actions: session.actionsByGame.get(s.id) || [],
+      actions: session.actions.get(s.id) || [],
       recordUrl: s.record_url || `/games/blackjack/records/${s.id}/`,
-    };
-
-    history.unshift(rec);
+    });
     history = history.slice(0, MAX_HISTORY);
     saveHistory();
-    render();
+    checkStopRules();
+  }
 
-    if (Number(settings.targetGames) > 0 && session.settled >= Number(settings.targetGames)) {
-      stopAuto(`已完成 ${session.settled}/${settings.targetGames} 局`);
+  function checkStopRules() {
+    if (!session.running) return;
+    const target = Number(settings.targetGames) || 0;
+    if (session.stopAfterCurrent) return stop('已按要求在本局结束后停止');
+    if (target > 0 && session.settled >= target) return stop(`已完成 ${session.settled}/${target} 局`);
+    if (settings.takeProfit > 0 && session.net >= settings.takeProfit) return stop(`止盈：本轮净收益 +${session.net}`);
+    if (settings.stopLoss > 0 && session.net <= -settings.stopLoss) return stop(`止损：本轮净收益 ${session.net}`);
+  }
+
+  function canStartAnother() {
+    const target = Number(settings.targetGames) || 0;
+    if (session.stopAfterCurrent) return false;
+    if (target > 0 && session.started >= target) return false;
+    const bet = Number(settings.bet);
+    if (coins != null && coins < bet) {
+      stop(`余额 ${coins}，不够再押 ${bet}`);
+      return false;
     }
+    if (settings.minBalance > 0 && coins != null && coins - bet < settings.minBalance) {
+      stop(`余额保护：下注后会低于 ${settings.minBalance}`);
+      return false;
+    }
+    return true;
   }
 
-  function registerStartedGame(s) {
-    if (!s?.id || session.gameIds.has(s.id)) return;
-    session.gameIds.add(s.id);
-    session.started++;
-    session.actionsByGame.set(s.id, []);
-    awaitingStart = null;
-    statusText = `第 ${session.started} 局已开始（#${s.id}）`;
+  /* ------------------------------------------------------------------ *
+   * 后台稳定 / 仅提示模式：读 state，按 reveal_at 精确调度；后台模式直接调接口
+   * ------------------------------------------------------------------ */
+  function schedule(ms) {
+    clearTimeout(loopTimer);
+    if (session.running) loopTimer = setTimeout(tick, Math.max(60, ms));
+  }
+
+  async function act(s, move, reason) {
+    const key = `${s.id}:${s.seq}:${s.active}:${move}`;
+    if (key === lastKey && Date.now() - lastKeyAt < 1500) return null;
+    lastKey = key;
+    lastKeyAt = Date.now();
+    adviceText = reason;
+    statusText = `执行：${reason}`;
     render();
-  }
-
-  async function syncState(force = false) {
-    if (!force && session.running && settings.runMode === 'background') return;
-
     try {
-      const s = await getState();
-      lastState = s;
-      lastStateError = '';
-      if (s?.coins != null) {
-        session.currentCoins = Number(s.coins);
-        if (session.initialCoins == null) session.initialCoins = Number(s.coins);
-      }
-
-      // 启动后如果本来已有未结束牌局，接管为本次第 1 局。
-      if (session.running && s?.id && s.status !== 'settled' && session.started === 0 && !awaitingStart) {
-        registerStartedGame(s);
-      }
-
-      // 由脚本点击“下注”后，只在看到新 game id 时才计数，避免“输入 3 只打 2”的错位。
-      if (session.running && awaitingStart && s?.id && s.id !== awaitingStart.beforeId) {
-        registerStartedGame(s);
-      }
-
-      if (s?.status === 'settled') recordSettlement(s);
-      render();
+      const res = await post(ENDPOINT.move, { game: s.id, seq: s.seq, move });
+      logAction(s.id, move, reason);
+      failStreak = 0;
+      if (res?.status === 'settled') recordSettlement(res);
+      return res;
     } catch (e) {
-      lastStateError = String(e?.message || e);
-      render();
+      // 允许同一步立刻重试（stale 表示别处已推进，重新读状态即可）。
+      lastKey = '';
+      throw e;
     }
   }
 
-  function selectBetAndDeal() {
-    if (awaitingStart) {
-      if (Date.now() - awaitingStart.clickedAt > 9000) {
-        awaitingStart = null;
-        statusText = '开局确认超时，准备重试';
-      } else {
-        return;
-      }
-    }
-
-    const target = Number(settings.targetGames) || 0;
-    if (target > 0 && session.started >= target) {
-      statusText = `已发起 ${session.started}/${target} 局，等待最后一局结算`;
-      return;
-    }
-
-    const bet = Number(settings.bet);
-    const chip = root.querySelector(`[data-bj-chip="${bet}"]`);
-    const deal = actionButton('deal');
-    if (!chip || !deal) return;
-
-    const pressed = chip.getAttribute('aria-pressed') === 'true';
-    if (!pressed) {
-      clickNative(chip, `选择筹码 ${bet}`);
-      return;
-    }
-
-    if (!deal.disabled && isVisible(deal)) {
-      awaitingStart = {
-        beforeId: lastState?.id ?? null,
-        clickedAt: Date.now(),
-      };
-      lastActionFingerprint = '';
-      clickNative(deal, `下注 ${bet}，开始第 ${session.started + 1} 局`);
-    }
-  }
-
-  function startNextFromSettled() {
-    const target = Number(settings.targetGames) || 0;
-    if (target > 0 && session.started >= target) {
-      statusText = `目标 ${target} 局已全部发起，等待结算记录`;
-      return;
-    }
-    const rebet = actionButton('rebet');
-    if (rebet && !rebet.disabled && isVisible(rebet)) {
-      clickNative(rebet, '重新押注');
-    }
-  }
-
-  async function apiStartGame(s) {
-    const target = Number(settings.targetGames) || 0;
-    if (target > 0 && session.started >= target) return;
-
-    const bet = Number(settings.bet);
-    const coins = Number(s?.coins ?? session.currentCoins ?? 0);
-    if (Number.isFinite(coins) && coins < bet) {
-      stopAuto(`余额 ${coins}，不足下注 ${bet}`);
-      return;
-    }
-
-    statusText = `后台接口下注 ${bet}，开始第 ${session.started + 1} 局`;
-    const res = await postAPI(CFG.Start, {
-      request: newRequestID(),
-      bet,
-    });
-
-    lastState = res;
-    if (res?.coins != null) session.currentCoins = Number(res.coins);
-    if (res?.id) registerStartedGame(res);
-  }
-
-  async function apiMoveGame(s, action, reason) {
-    const key = `${s.id}:${s.seq}:${s.phase}:${s.active}:${action}`;
-    if (lastActionFingerprint === key && Date.now() - lastActionAt < 1800) return;
-
-    lastActionFingerprint = key;
-    lastActionAt = Date.now();
-    lastState = s;
-    recommendationText = reason;
-    logAction(action, reason);
-    statusText = `后台接口执行：${reason}`;
-
-    const res = await postAPI(CFG.Move, {
-      game: s.id,
-      seq: s.seq,
-      move: action,
-    });
-
-    lastState = res;
-    if (res?.coins != null) session.currentCoins = Number(res.coins);
-    if (res?.status === 'settled') recordSettlement(res);
-  }
-
-  async function apiMainLoop() {
-    if (!session.running || settings.runMode !== 'background' || apiBusy) return;
-
-    apiBusy = true;
+  async function tick() {
+    if (!session.running || busy) return;
+    if (settings.mode === 'visible') return visibleTick();
+    busy = true;
+    let wait = 400;
     try {
       const s = await getState();
-      lastState = s;
-      lastStateError = '';
+      errorText = '';
+      failStreak = 0;
 
-      if (s?.coins != null) {
-        session.currentCoins = Number(s.coins);
-        if (session.initialCoins == null) session.initialCoins = Number(s.coins);
-      }
-
-      if (s?.id && s.status !== 'settled') registerStartedGame(s);
+      if (s?.id && s.status !== 'settled') registerStarted(s);
       if (s?.status === 'settled') recordSettlement(s);
-
-      const target = Number(settings.targetGames) || 0;
       if (!session.running) return;
-      if (target > 0 && session.settled >= target) return;
 
       if (!s?.id || s.status === 'settled') {
-        if (target === 0 || session.started < target) await apiStartGame(s);
+        if (settings.mode === 'hint') { statusText = '仅提示：请手动下注开局'; adviceText = '—'; wait = 700; return; }
+        if (!canStartAnother()) {
+          if (session.running) { statusText = '等待最后一局结算'; wait = 500; }
+          return;
+        }
+        statusText = `下注 ${settings.bet}，开始第 ${session.started + 1} 局`;
+        render();
+        const res = await post(ENDPOINT.start, { request: requestId(), bet: settings.bet });
+        registerStarted(res);
+        wait = res?.reveal_at ? Number(res.reveal_at) - serverNow() + 250 : 300;
         return;
       }
 
       if (s.pending_round || s.phase === 'wait') {
+        const left = s.reveal_at ? Number(s.reveal_at) - serverNow() : 800;
         statusText = s.pending_round
-          ? `后台等待 drand #${s.pending_round}`
-          : '后台等待发牌/庄家补牌';
+          ? `等 drand 第 ${s.pending_round} 轮${left > 0 ? `（约 ${Math.ceil(left / 1000)} 秒）` : ''}`
+          : '等待发牌 / 庄家补牌';
+        wait = Math.min(1200, Math.max(150, left + 250));
         return;
       }
 
       if (s.phase === 'insurance') {
-        await apiMoveGame(s, 'noinsure', '庄家 A → 不买保险');
+        const why = '庄家 A → 不买保险';
+        if (settings.mode === 'hint') { adviceText = why; statusText = deadlineText(s) || '请手动操作'; wait = 400; return; }
+        await act(s, 'noinsure', why);
+        wait = 200;
         return;
       }
 
       if (s.phase === 'play') {
         const d = decideFromState(s);
-        if (!d) {
-          statusText = '后台等待牌局状态完整';
+        if (!d) { statusText = '等待牌局状态完整'; wait = 250; return; }
+        if (settings.mode === 'hint') {
+          adviceText = d.reason;
+          statusText = deadlineText(s) || '轮到你了';
+          wait = 400;
           return;
         }
-        await apiMoveGame(s, d.action, d.reason);
+        await act(s, d.action, d.reason);
+        wait = 150;
         return;
       }
 
-      statusText = `后台等待状态：${s.status || ''}/${s.phase || ''}`;
+      statusText = `等待：${s.status || ''}/${s.phase || ''}`;
     } catch (e) {
-      lastStateError = String(e?.message || e);
-      statusText = `后台接口错误：${lastStateError}`;
+      failStreak++;
+      errorText = String(e?.message || e);
+      statusText = failStreak > 1 ? `接口出错，第 ${failStreak} 次重试` : '接口出错，马上重试';
+      // 出错先快速重试，避免拖过 10 秒决策时间被判停牌；连续失败再逐步退避。
+      wait = failStreak <= 3 ? 250 : Math.min(4000, 500 * failStreak);
+      if (failStreak >= 12) stop(`接口连续失败 ${failStreak} 次，已停止`);
     } finally {
-      apiBusy = false;
+      busy = false;
       render();
+      schedule(wait);
     }
   }
 
-  function mainLoop() {
-    if (!session.running) return;
+  function deadlineText(s) {
+    if (!s?.decide_by) return '';
+    const left = Math.ceil((Number(s.decide_by) - serverNow()) / 1000);
+    return left > 0 ? `还剩 ${left} 秒，超时按${s.phase === 'insurance' ? '不买' : '停牌'}处理` : '时间到';
+  }
 
-    if (settings.runMode === 'background') {
-      apiMainLoop();
-      return;
+  // 后台标签页的 setTimeout 会被节流，用 Worker 心跳把循环叫醒。
+  function startWorker() {
+    stopWorker();
+    try {
+      workerUrl = URL.createObjectURL(new Blob([
+        'let t=null;onmessage=e=>{clearInterval(t);if(e.data>0)t=setInterval(()=>postMessage(1),e.data)}',
+      ], { type: 'text/javascript' }));
+      worker = new Worker(workerUrl);
+      worker.onmessage = () => { if (session.running && !busy && settings.mode !== 'visible') tick(); };
+      worker.postMessage(500);
+    } catch {
+      stopWorker();
     }
+  }
+  function stopWorker() {
+    if (worker) { try { worker.postMessage(0); } catch {} worker.terminate(); worker = null; }
+    if (workerUrl) { URL.revokeObjectURL(workerUrl); workerUrl = null; }
+  }
 
-    const phase = phaseFromDOM();
+  /* ------------------------------------------------------------------ *
+   * 前台可视模式：读站点 state 决策，点网页原生按钮（保留动画）
+   * ------------------------------------------------------------------ */
+  const isShown = (node) => !!node && !node.hidden && !node.closest('[hidden]') && getComputedStyle(node).display !== 'none';
+  const btn = (name) => root.querySelector(`[data-bj-act="${name}"]`);
+  const usable = (node) => isShown(node) && !node.disabled;
 
-    if (phase === 'bet') {
-      selectBetAndDeal();
-      return sleepLoop(140);
-    }
+  function domPhase() {
+    if (isShown(root.querySelector('[data-bj-wait]'))) return 'wait';
+    if (isShown(root.querySelector('[data-bj-ins-row]'))) return 'insurance';
+    if (isShown(root.querySelector('[data-bj-play-row]'))) return 'play';
+    if (isShown(root.querySelector('[data-bj-again-row]'))) return 'settled';
+    if (isShown(root.querySelector('[data-bj-bet-row]'))) return 'bet';
+    return 'transition';
+  }
 
-    if (phase === 'insurance') {
-      recommendationText = '庄家 A → 不买保险';
-      clickAction('noinsure', '庄家 A → 不买保险');
-      return sleepLoop(140);
-    }
+  function press(node, why) {
+    if (!usable(node)) return false;
+    const now = Date.now();
+    if (now < nextVisibleAt) return false;
+    nextVisibleAt = now + Math.max(120, Number(settings.actionDelay) || 350);
+    statusText = why;
+    node.click();
+    return true;
+  }
 
-    if (phase === 'play') {
-      const cards = activeHandCards();
-      const dealer = dealerUpCard();
-      if (cards.length && dealer) {
-        const d = decide(cards, dealer);
-        recommendationText = d.reason;
-        clickAction(d.action, d.reason, cards, dealer);
-      } else {
-        statusText = '等待牌面渲染';
+  async function visibleTick() {
+    if (!session.running || busy) return;
+    busy = true;
+    let wait = 160;
+    try {
+      const phase = domPhase();
+      let s = lastState;
+      // 决策只认站点 state，不解析牌面 DOM。
+      if (phase === 'play' || phase === 'insurance' || phase === 'settled' || awaitingStart) s = await getState();
+      errorText = '';
+      failStreak = 0;
+      if (s?.id && s.status !== 'settled') {
+        if (awaitingStart ? s.id !== awaitingStart.before : session.started === 0) registerStarted(s);
       }
-      return sleepLoop(120);
-    }
+      if (s?.status === 'settled') recordSettlement(s);
+      if (!session.running) return;
 
-    if (phase === 'settled') {
-      startNextFromSettled();
-      return sleepLoop(180);
-    }
+      if (phase === 'bet') {
+        if (awaitingStart && Date.now() - awaitingStart.at < 8000) { statusText = '等待开局'; return; }
+        awaitingStart = null;
+        if (!canStartAnother()) { if (session.running) statusText = '等待最后一局结算'; return; }
+        const chip = root.querySelector(`[data-bj-chip="${settings.bet}"]`);
+        if (!chip) { statusText = `页面没有 ${settings.bet} 筹码`; return; }
+        if (chip.getAttribute('aria-pressed') !== 'true') { press(chip, `选择筹码 ${settings.bet}`); return; }
+        if (usable(btn('deal'))) {
+          const before = lastState?.id ?? null;
+          if (press(btn('deal'), `下注 ${settings.bet}，开始第 ${session.started + 1} 局`)) awaitingStart = { before, at: Date.now() };
+        }
+        return;
+      }
 
-    if (phase === 'wait') {
-      const waitText = $('[data-bj-wait-text]', root)?.textContent?.trim();
-      statusText = waitText || '等待 drand 随机数';
-      return sleepLoop(300);
-    }
+      if (phase === 'insurance') {
+        adviceText = '庄家 A → 不买保险';
+        if (s?.phase === 'insurance' && press(btn('noinsure'), '不买保险')) logAction(s.id, 'noinsure', adviceText);
+        return;
+      }
 
-    statusText = '等待页面状态切换';
-    sleepLoop(180);
+      if (phase === 'play') {
+        if (s?.phase !== 'play') { statusText = '等待牌局状态'; return; }
+        // 以页面上真正能点的按钮为准：站点会按本地余额禁用加倍/分牌，和 state.can 不一定一致。
+        const live = {
+          ...s,
+          can: {
+            Hit: !!s.can?.Hit && usable(btn('hit')),
+            Stand: !!s.can?.Stand && usable(btn('stand')),
+            Double: !!s.can?.Double && usable(btn('double')),
+            Split: !!s.can?.Split && usable(btn('split')),
+          },
+        };
+        const d = decideFromState(live);
+        if (!d) { statusText = '等待按钮可用'; return; }
+        adviceText = d.reason;
+        const key = `${s.id}:${s.seq}:${s.active}:${d.action}`;
+        if (key === lastKey && Date.now() - lastKeyAt < 1800) return;
+        if (press(btn(d.action), `执行：${d.reason}`)) {
+          lastKey = key;
+          lastKeyAt = Date.now();
+          logAction(s.id, d.action, d.reason);
+        }
+        return;
+      }
+
+      if (phase === 'settled') {
+        if (!canStartAnother()) { if (session.running) statusText = '目标局数已全部发起'; return; }
+        press(btn('rebet'), '重新押注');
+        wait = 220;
+        return;
+      }
+
+      if (phase === 'wait') {
+        statusText = root.querySelector('[data-bj-wait-text]')?.textContent?.trim() || '等待 drand 随机数';
+        wait = 300;
+        return;
+      }
+      statusText = '等待页面切换';
+    } catch (e) {
+      failStreak++;
+      errorText = String(e?.message || e);
+      wait = failStreak <= 3 ? 250 : Math.min(3000, 400 * failStreak);
+    } finally {
+      busy = false;
+      render();
+      clearTimeout(loopTimer);
+      if (session.running) loopTimer = setTimeout(tick, wait);
+    }
   }
 
-  async function startAuto() {
-    settings.bet = Number(ui.bet.value);
-    settings.runMode = ui.runMode.value === 'background' ? 'background' : 'visible';
-    settings.targetGames = Math.max(0, parseInt(ui.target.value || '0', 10) || 0);
-    settings.actionDelay = Math.max(120, Math.min(1500, parseInt(ui.delay.value || '350', 10) || 350));
-    saveSettings();
-
-    session.running = true;
-    session.started = 0;
-    session.settled = 0;
-    session.wins = 0;
-    session.losses = 0;
-    session.pushes = 0;
-    session.wagered = 0;
-    session.returned = 0;
-    session.net = 0;
-    session.initialCoins = null;
-    session.currentCoins = null;
+  /* ------------------------------------------------------------------ *
+   * 启停
+   * ------------------------------------------------------------------ */
+  function resetSession() {
+    Object.assign(session, {
+      stopAfterCurrent: false, started: 0, settled: 0, wins: 0, losses: 0, pushes: 0,
+      blackjacks: 0, doubles: 0, splits: 0, busts: 0,
+      wagered: 0, returned: 0, net: 0, peak: 0, trough: 0, curve: [0],
+    });
     session.gameIds.clear();
     session.settledIds.clear();
-    session.actionsByGame.clear();
-    awaitingStart = null;
-    lastActionFingerprint = '';
-    lastActionAt = 0;
-    nextActionAt = 0;
-    apiBusy = false;
-    statusText = '启动中，读取当前牌局…';
-    recommendationText = '—';
-    render();
-
-    await syncState(true);
-
-    if (settings.runMode === 'background') {
-      startBackgroundHeartbeat();
-      statusText = '后台稳定模式已启动';
-      mainLoop();
-      return;
-    }
-
-    stopBackgroundHeartbeat();
-
-    // 若当前已经是已结算局，不把旧局计入本次；回到下注页后开始新的目标局数。
-    if (lastState?.status === 'settled') {
-      const rebet = actionButton('rebet');
-      if (rebet && isVisible(rebet) && !rebet.disabled) clickNative(rebet, '准备新一轮自动局');
-    }
-
-    mainLoop();
+    session.actions.clear();
   }
 
-  function stopAuto(reason = '手动停止') {
-    session.running = false;
+  async function start() {
+    readForm();
+    resetSession();
+    session.running = true;
     awaitingStart = null;
-    apiBusy = false;
-    stopBackgroundHeartbeat();
+    lastKey = '';
+    failStreak = 0;
+    errorText = '';
+    adviceText = '—';
+    statusText = '启动中…';
+    render();
+    try {
+      const s = await getState();
+      // 已有进行中的局：接管为本轮第 1 局。
+      if (s?.id && s.status !== 'settled') registerStarted(s);
+    } catch (e) {
+      errorText = String(e?.message || e);
+    }
+    if (!session.running) return;
+    if (settings.mode !== 'visible') startWorker();
+    else {
+      stopWorker();
+      if (lastState?.status === 'settled' && canStartAnother()) press(btn('rebet'), '准备新一轮');
+    }
+    tick();
+  }
+
+  function stop(reason = '已停止') {
+    session.running = false;
+    session.stopAfterCurrent = false;
+    awaitingStart = null;
+    stopWorker();
     clearTimeout(loopTimer);
     statusText = reason;
-    recommendationText = '—';
+    if (settings.mode !== 'hint') adviceText = '—';
     render();
   }
 
-  function resultLabel(net) {
-    if (net > 0) return '赢';
-    if (net < 0) return '输';
-    return '平';
+  function stopAfterCurrent() {
+    if (!session.running) return;
+    const s = lastState;
+    if (!s?.id || s.status === 'settled' || !session.gameIds.has(s.id)) return stop('已停止');
+    session.stopAfterCurrent = true;
+    statusText = '本局结束后停止';
+    render();
   }
 
-  function fmtSigned(n) {
-    n = Number(n) || 0;
-    return `${n > 0 ? '+' : ''}${n}`;
+  /* ------------------------------------------------------------------ *
+   * UI（Shadow DOM，样式与站点完全隔离）
+   * ------------------------------------------------------------------ */
+  const host = document.createElement('div');
+  host.id = 'bj-auto-pro-host';
+  const edge = window.innerWidth < 520 ? 8 : 16;
+  host.style.cssText = `position:fixed;z-index:2147483646;right:${edge}px;bottom:${edge}px;`;
+  document.body.appendChild(host);
+  const shadow = host.attachShadow({ mode: 'open' });
+
+  shadow.innerHTML = `
+  <style>
+    :host{all:initial}
+    *{box-sizing:border-box;margin:0}
+    button{font:inherit}
+    .panel{width:360px;max-width:calc(100vw - 24px);font:12.5px/1.45 ui-sans-serif,system-ui,-apple-system,"Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;color:#e8ecf2;
+      background:linear-gradient(180deg,rgba(24,30,38,.96),rgba(14,18,24,.97));border:1px solid rgba(255,255,255,.09);border-radius:16px;
+      box-shadow:0 24px 60px -12px rgba(0,0,0,.6),inset 0 1px 0 rgba(255,255,255,.05);backdrop-filter:blur(14px);overflow:hidden}
+    .head{display:flex;align-items:center;gap:10px;padding:12px 14px;cursor:grab;user-select:none;touch-action:none}
+    .head:active{cursor:grabbing}
+    .panel:not(.collapsed) .head{border-bottom:1px solid rgba(255,255,255,.06)}
+    .logo{width:28px;height:28px;border-radius:9px;display:grid;place-items:center;background:linear-gradient(135deg,#f3cd66,#c7922b);color:#1b1406;font:800 13px ui-monospace,monospace;box-shadow:0 6px 14px -6px rgba(241,199,91,.7)}
+    .title{flex:1;min-width:0}
+    .title b{display:block;font-size:13px;letter-spacing:.2px}
+    .title small{display:flex;align-items:center;gap:6px;color:#8b96a7;font-size:11px}
+    .mini{font:700 12px ui-monospace,monospace}
+    .dot{width:7px;height:7px;border-radius:50%;background:#5b6472;flex:none}
+    .dot.on{background:#4ade80;animation:pulse 1.6s infinite}
+    @keyframes pulse{0%{box-shadow:0 0 0 0 rgba(74,222,128,.45)}70%{box-shadow:0 0 0 6px rgba(74,222,128,0)}100%{box-shadow:0 0 0 0 rgba(74,222,128,0)}}
+    .icon{width:28px;height:28px;border:0;border-radius:8px;background:rgba(255,255,255,.06);color:#c8d0dc;cursor:pointer;display:grid;place-items:center;font-size:13px}
+    .icon:hover{background:rgba(255,255,255,.12)}
+    .body{padding:12px 14px 14px}
+    .hidden{display:none!important}
+    .hero{display:grid;grid-template-columns:1fr auto;align-items:end;gap:2px 8px;padding:12px 12px 8px;border-radius:12px;background:rgba(255,255,255,.035);border:1px solid rgba(255,255,255,.06)}
+    .lbl{color:#8b96a7;font-size:11px}
+    .net{font:700 26px/1.15 ui-monospace,SFMono-Regular,Menlo,monospace;letter-spacing:-.5px}
+    .meta{color:#9aa5b5;font-size:11px}
+    .bal{text-align:right}
+    .bal b{font:600 15px ui-monospace,SFMono-Regular,Menlo,monospace}
+    svg.spark{grid-column:1/-1;width:100%;height:38px;margin-top:6px;display:block}
+    .pos{color:#5fe08f}.neg{color:#ff7b84}
+    .now{margin-top:10px;display:grid;gap:6px}
+    .line{display:flex;gap:8px;align-items:flex-start;padding:8px 10px;border-radius:10px;background:rgba(0,0,0,.22)}
+    .line span{flex:none;width:30px;color:#7f8a9b;font-size:11px;padding-top:1px}
+    .line b{font-weight:600;word-break:break-word;min-height:18px}
+    .advice b{color:#f3cd66}
+    .tabs{display:flex;gap:4px;margin:12px 0 10px;padding:3px;border-radius:10px;background:rgba(0,0,0,.25)}
+    .tabs button{flex:1;height:28px;border:0;border-radius:8px;background:transparent;color:#9aa5b5;font-weight:600;cursor:pointer}
+    .tabs button.on{background:rgba(255,255,255,.09);color:#fff}
+    .grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+    .full{grid-column:1/-1}
+    label{display:flex;flex-direction:column;gap:4px;color:#8b96a7;font-size:11px}
+    input{height:32px;width:100%;border-radius:8px;border:1px solid rgba(255,255,255,.1);background:rgba(0,0,0,.3);color:#fff;padding:0 9px;font:13px ui-monospace,monospace;outline:none}
+    input:focus{border-color:#f3cd66;box-shadow:0 0 0 3px rgba(241,199,91,.15)}
+    input:disabled{opacity:.5}
+    .sec{grid-column:1/-1;color:#6f7a8b;font-size:10.5px;letter-spacing:.5px;margin-top:2px}
+    .chips{grid-column:1/-1;display:flex;gap:6px}
+    .chip{flex:1;height:34px;border-radius:999px;border:1px solid rgba(255,255,255,.12);background:rgba(255,255,255,.04);color:#dfe5ee;font:600 12px ui-monospace,monospace;cursor:pointer;transition:transform .1s}
+    .chip:hover:not(:disabled){transform:translateY(-1px)}
+    .chip.on{background:linear-gradient(135deg,#f3cd66,#c7922b);color:#1b1406;border-color:transparent}
+    .chip:disabled{opacity:.45;cursor:not-allowed}
+    .modes{grid-column:1/-1;display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+    .mode{padding:8px;border-radius:10px;border:1px solid rgba(255,255,255,.1);background:rgba(255,255,255,.03);color:#cfd6e0;text-align:left;cursor:pointer}
+    .mode b{display:block;font-size:12px}
+    .mode small{color:#7f8a9b;font-size:10.5px}
+    .mode.on{border-color:#f3cd66;background:rgba(241,199,91,.08)}
+    .mode:disabled:not(.on){opacity:.45;cursor:not-allowed}
+    .actions{display:grid;grid-template-columns:1fr auto;gap:8px;margin-top:12px}
+    .primary{height:38px;border:0;border-radius:10px;background:linear-gradient(135deg,#f3cd66,#d49d32);color:#1b1406;font-weight:700;font-size:13px;cursor:pointer;box-shadow:0 8px 20px -10px rgba(241,199,91,.8)}
+    .primary.stop{background:linear-gradient(135deg,#ff7b84,#e0525c);color:#fff;box-shadow:0 8px 20px -10px rgba(255,123,132,.8)}
+    .ghost{height:38px;padding:0 12px;border:1px solid rgba(255,255,255,.12);border-radius:10px;background:transparent;color:#dfe5ee;font-weight:600;cursor:pointer}
+    .ghost:disabled{opacity:.4;cursor:not-allowed}
+    .progress{margin-top:10px;height:4px;border-radius:99px;background:rgba(255,255,255,.07);overflow:hidden}
+    .progress i{display:block;height:100%;width:0;background:linear-gradient(90deg,#f3cd66,#5fe08f);transition:width .3s}
+    .progress.inf i{width:35%!important;animation:slide 1.4s ease-in-out infinite}
+    @keyframes slide{0%{transform:translateX(-100%)}100%{transform:translateX(290%)}}
+    .ptext{margin-top:5px;color:#7f8a9b;font-size:11px;text-align:right}
+    .stats{display:grid;grid-template-columns:repeat(3,1fr);gap:6px}
+    .stat{padding:8px;border-radius:10px;background:rgba(255,255,255,.035)}
+    .stat span{display:block;color:#7f8a9b;font-size:10.5px}
+    .stat b{display:block;margin-top:2px;font:600 13px ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .note{margin-top:10px;padding:9px 10px;border-radius:10px;background:rgba(241,199,91,.07);color:#cdb67a;font-size:11px}
+    .hist-tools{display:flex;justify-content:space-between;align-items:center;margin-bottom:8px;color:#8b96a7;font-size:11px}
+    .hist-tools div{display:flex;gap:6px}
+    .small{height:26px;padding:0 9px;border:1px solid rgba(255,255,255,.12);border-radius:7px;background:transparent;color:#dfe5ee;font-size:11px;cursor:pointer}
+    .list{max-height:260px;overflow:auto;display:grid;gap:6px;padding-right:2px}
+    .list::-webkit-scrollbar{width:6px}.list::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:9px}
+    .item{display:grid;grid-template-columns:1fr auto;gap:2px 8px;padding:8px 10px;border-radius:10px;background:rgba(255,255,255,.035);text-decoration:none;color:inherit}
+    .item:hover{background:rgba(255,255,255,.07)}
+    .cards{font:12px ui-monospace,monospace;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .cards em{font-style:normal;color:#7f8a9b}
+    .red{color:#ff8f96}
+    .amt{font:700 12.5px ui-monospace,monospace;text-align:right}
+    .sub{grid-column:1/-1;color:#7f8a9b;font-size:10.5px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
+    .empty{padding:18px;text-align:center;color:#6f7a8b}
+    .err{margin-top:8px;color:#ff9aa1;font-size:11px;word-break:break-word}
+    .err:empty{display:none}
+    .foot{margin-top:10px;color:#5f6a7a;font-size:10.5px;text-align:center}
+    .body{max-height:calc(100vh - 96px);overflow:auto;overscroll-behavior:contain}
+    .body::-webkit-scrollbar{width:6px}.body::-webkit-scrollbar-thumb{background:rgba(255,255,255,.12);border-radius:9px}
+    @media (max-width:520px){.panel{width:calc(100vw - 16px)}.list{max-height:200px}}
+  </style>
+  <div class="panel">
+    <div class="head" data-drag>
+      <div class="logo">21</div>
+      <div class="title"><b>Blackjack Auto Pro</b><small><i class="dot" data-dot></i><span data-mode-label></span></small></div>
+      <span class="mini hidden" data-mini></span>
+      <button class="icon" data-collapse title="收起 / 展开">▾</button>
+    </div>
+    <div class="body" data-body>
+      <div class="hero">
+        <div>
+          <div class="lbl">本轮净收益</div>
+          <div class="net" data-net>0</div>
+          <div class="meta" data-meta></div>
+        </div>
+        <div class="bal"><div class="lbl">余额</div><b data-coins>—</b></div>
+        <svg class="spark" data-spark viewBox="0 0 300 38" preserveAspectRatio="none"></svg>
+      </div>
+      <div class="now">
+        <div class="line"><span>状态</span><b data-status></b></div>
+        <div class="line advice"><span>策略</span><b data-advice></b></div>
+      </div>
+      <div class="tabs">
+        <button data-tab="run">运行</button>
+        <button data-tab="stats">统计</button>
+        <button data-tab="history">历史</button>
+      </div>
+
+      <section data-pane="run">
+        <div class="grid">
+          <div class="modes">
+            <button class="mode" data-mode="visible"><b>前台可视</b><small>点网页按钮</small></button>
+            <button class="mode" data-mode="background"><b>后台稳定</b><small>切走也能跑</small></button>
+            <button class="mode" data-mode="hint"><b>仅提示</b><small>你点我算</small></button>
+          </div>
+          <div class="sec">每手下注</div>
+          <div class="chips" data-chips></div>
+          <div class="sec">停止条件（0 = 关闭）</div>
+          <label>局数<input data-f="targetGames" type="number" min="0" step="1"></label>
+          <label>余额保护<input data-f="minBalance" type="number" min="0" step="10" title="下注后余额会低于这个数就停"></label>
+          <label>止盈 +<input data-f="takeProfit" type="number" min="0" step="10" title="本轮净赚到这个数就停"></label>
+          <label>止损 −<input data-f="stopLoss" type="number" min="0" step="10" title="本轮净亏到这个数就停"></label>
+          <label class="full" data-delay-row>前台操作间隔（毫秒）<input data-f="actionDelay" type="number" min="120" max="2000" step="10"></label>
+        </div>
+        <div class="actions">
+          <button class="primary" data-toggle>开始</button>
+          <button class="ghost" data-soft-stop title="当前这局打完再停">打完本局停</button>
+        </div>
+        <div class="progress" data-progress-bar><i data-bar></i></div>
+        <div class="ptext" data-progress></div>
+      </section>
+
+      <section data-pane="stats" class="hidden">
+        <div class="stats">
+          <div class="stat"><span>胜 / 负 / 平</span><b data-s="wlp"></b></div>
+          <div class="stat"><span>胜率（不含平）</span><b data-s="winrate"></b></div>
+          <div class="stat"><span>RTP</span><b data-s="rtp"></b></div>
+          <div class="stat"><span>总押注</span><b data-s="wagered"></b></div>
+          <div class="stat"><span>最高 / 最低</span><b data-s="range"></b></div>
+          <div class="stat"><span>黑杰克</span><b data-s="bj"></b></div>
+          <div class="stat"><span>加倍 / 分牌</span><b data-s="ds"></b></div>
+          <div class="stat"><span>爆牌手数</span><b data-s="busts"></b></div>
+          <div class="stat"><span>理论期望</span><b data-s="ev"></b></div>
+        </div>
+        <div class="note">按最优基本策略，这张桌子长期回报率约 99.5%（平均每局亏底注的 0.5% 左右）。每局重新洗牌、牌在你决定之后才由 drand 生成，算牌和倍投都改变不了期望；止盈止损只是帮你在运气好时收手。</div>
+      </section>
+
+      <section data-pane="history" class="hidden">
+        <div class="hist-tools"><span data-hist-count></span><div><button class="small" data-export>导出 CSV</button><button class="small" data-clear>清空</button></div></div>
+        <div class="list" data-list></div>
+      </section>
+
+      <div class="err" data-err></div>
+      <div class="foot">v${VERSION} · 6 副牌 · 软 17 停 · 分牌后可加倍 · 不买保险</div>
+    </div>
+  </div>`;
+
+  const q = (sel) => shadow.querySelector(sel);
+  const qa = (sel) => [...shadow.querySelectorAll(sel)];
+  const ui = {
+    panel: q('.panel'), body: q('[data-body]'), drag: q('[data-drag]'), collapse: q('[data-collapse]'), mini: q('[data-mini]'),
+    dot: q('[data-dot]'), modeLabel: q('[data-mode-label]'), net: q('[data-net]'), meta: q('[data-meta]'),
+    coins: q('[data-coins]'), spark: q('[data-spark]'), status: q('[data-status]'), advice: q('[data-advice]'),
+    chips: q('[data-chips]'), toggle: q('[data-toggle]'), softStop: q('[data-soft-stop]'), bar: q('[data-bar]'),
+    progressBar: q('[data-progress-bar]'), progress: q('[data-progress]'), list: q('[data-list]'),
+    histCount: q('[data-hist-count]'), err: q('[data-err]'), delayRow: q('[data-delay-row]'),
+  };
+  const fields = Object.fromEntries(qa('[data-f]').map((i) => [i.dataset.f, i]));
+  const MODE_TEXT = { visible: '前台可视', background: '后台稳定', hint: '仅提示' };
+
+  for (const c of CHIPS) {
+    const b = document.createElement('button');
+    b.className = 'chip';
+    b.dataset.chip = String(c);
+    b.textContent = c >= 1000 && c % 1000 === 0 ? `${c / 1000}k` : String(c);
+    ui.chips.appendChild(b);
+  }
+  for (const [k, input] of Object.entries(fields)) input.value = String(settings[k] ?? 0);
+
+  const clampInt = (v, min, max, dflt) => {
+    const n = parseInt(v, 10);
+    return Number.isFinite(n) ? Math.min(max, Math.max(min, n)) : dflt;
+  };
+  function readForm() {
+    settings.targetGames = clampInt(fields.targetGames.value, 0, 100000, 0);
+    settings.actionDelay = clampInt(fields.actionDelay.value, 120, 2000, 350);
+    settings.takeProfit = clampInt(fields.takeProfit.value, 0, 1e9, 0);
+    settings.stopLoss = clampInt(fields.stopLoss.value, 0, 1e9, 0);
+    settings.minBalance = clampInt(fields.minBalance.value, 0, 1e9, 0);
+    for (const [k, input] of Object.entries(fields)) input.value = String(settings[k]);
+    saveSettings();
   }
 
-  function esc(s) {
-    return String(s ?? '').replace(/[&<>"']/g, c => ({
-      '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
-    })[c]);
+  for (const input of Object.values(fields)) {
+    input.addEventListener('change', () => {
+      readForm();
+      // 运行中调高/调低局数、止盈止损立即生效。
+      if (session.running) checkStopRules();
+      render();
+    });
+  }
+  ui.chips.addEventListener('click', (e) => {
+    const b = e.target.closest('[data-chip]');
+    if (!b || b.disabled) return;
+    settings.bet = Number(b.dataset.chip);
+    saveSettings();
+    render();
+  });
+  qa('[data-mode]').forEach((b) => b.addEventListener('click', () => {
+    if (session.running) return;
+    settings.mode = b.dataset.mode;
+    saveSettings();
+    render();
+  }));
+  qa('[data-tab]').forEach((b) => b.addEventListener('click', () => {
+    settings.tab = b.dataset.tab;
+    saveSettings();
+    render();
+  }));
+  ui.toggle.addEventListener('click', () => (session.running ? stop('手动停止') : start()));
+  ui.softStop.addEventListener('click', stopAfterCurrent);
+  ui.collapse.addEventListener('click', () => { settings.collapsed = !settings.collapsed; saveSettings(); render(); });
+  q('[data-export]').addEventListener('click', exportCSV);
+  q('[data-clear]').addEventListener('click', () => {
+    if (!confirm('清空脚本保存的本地历史记录？')) return;
+    history = [];
+    localStorage.removeItem(HISTORY_KEY);
+    render();
+  });
+
+  // 拖动面板，位置会记住；窗口缩放时保持在可视范围内。
+  const placePanel = () => {
+    if (settings.x == null || settings.y == null) return;
+    const r = host.getBoundingClientRect();
+    const x = Math.min(Math.max(0, settings.x), Math.max(0, window.innerWidth - r.width));
+    const y = Math.min(Math.max(0, settings.y), Math.max(0, window.innerHeight - 48));
+    Object.assign(host.style, { left: `${x}px`, top: `${y}px`, right: 'auto', bottom: 'auto' });
+  };
+  (() => {
+    let sx = 0, sy = 0, ox = 0, oy = 0, dragging = false;
+    ui.drag.addEventListener('pointerdown', (e) => {
+      if (e.button !== 0 || e.target.closest('button')) return;
+      dragging = true;
+      const r = host.getBoundingClientRect();
+      sx = e.clientX; sy = e.clientY; ox = r.left; oy = r.top;
+      ui.drag.setPointerCapture(e.pointerId);
+    });
+    ui.drag.addEventListener('pointermove', (e) => {
+      if (!dragging) return;
+      settings.x = ox + e.clientX - sx;
+      settings.y = oy + e.clientY - sy;
+      placePanel();
+    });
+    const end = () => { if (dragging) { dragging = false; saveSettings(); } };
+    ui.drag.addEventListener('pointerup', end);
+    ui.drag.addEventListener('pointercancel', end);
+    ui.drag.addEventListener('dblclick', (e) => {
+      if (e.target.closest('button')) return;
+      settings.x = settings.y = null;
+      Object.assign(host.style, { left: 'auto', top: 'auto', right: `${edge}px`, bottom: `${edge}px` });
+      saveSettings();
+    });
+    window.addEventListener('resize', placePanel);
+  })();
+
+  const signed = (n) => `${n > 0 ? '+' : ''}${Number(n) || 0}`;
+  const esc = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' })[c]);
+  const cardHTML = (label) => esc(label).replace(/^([♥♦])/, '<span class="red">$1</span>');
+
+  function sparkline() {
+    const pts = session.curve;
+    if (pts.length < 2) return '<line x1="0" y1="19" x2="300" y2="19" stroke="rgba(255,255,255,.14)" stroke-dasharray="3 4"/>';
+    const min = Math.min(0, ...pts);
+    const max = Math.max(0, ...pts);
+    const span = max - min || 1;
+    const xy = pts.map((v, i) => [(i / (pts.length - 1)) * 300, 35 - ((v - min) / span) * 32]);
+    const d = xy.map(([x, y], i) => `${i ? 'L' : 'M'}${x.toFixed(1)} ${y.toFixed(1)}`).join('');
+    const zero = (35 - ((0 - min) / span) * 32).toFixed(1);
+    const color = session.net >= 0 ? '#5fe08f' : '#ff7b84';
+    return `<defs><linearGradient id="g" x1="0" x2="0" y1="0" y2="1"><stop offset="0" stop-color="${color}" stop-opacity=".32"/><stop offset="1" stop-color="${color}" stop-opacity="0"/></linearGradient></defs>
+      <line x1="0" y1="${zero}" x2="300" y2="${zero}" stroke="rgba(255,255,255,.14)" stroke-dasharray="3 4"/>
+      <path d="${d}L300 ${zero}L0 ${zero}Z" fill="url(#g)"/><path d="${d}" fill="none" stroke="${color}" stroke-width="1.6" stroke-linejoin="round" vector-effect="non-scaling-stroke"/>`;
   }
 
   function renderHistory() {
-    const rows = history.slice(0, 20).map(r => {
-      const player = (r.hands || []).map((h, i) => `${r.hands.length > 1 ? `H${i+1}:` : ''}${(h.cards || []).join(' ')}(${h.total ?? '?'})`).join(' / ');
-      const dealer = `${(r.dealer || []).join(' ')}${r.dealerTotal != null ? `(${r.dealerTotal})` : ''}`;
-      const actionTip = (r.actions || []).map(a => a.reason).join('；') || '无玩家操作（可能天然黑杰克）';
-      return `
-        <tr title="${esc(actionTip)}">
-          <td><a href="${esc(r.recordUrl)}" target="_blank" rel="noopener">#${esc(r.id)}</a></td>
-          <td>${esc(player)}</td>
-          <td>${esc(dealer)}</td>
-          <td>${esc(r.staked)}</td>
-          <td class="${r.net > 0 ? 'pos' : r.net < 0 ? 'neg' : ''}">${esc(fmtSigned(r.net))}</td>
-          <td>${esc(resultLabel(r.net))}</td>
-        </tr>`;
+    ui.histCount.textContent = `共 ${history.length} 局 · 本地最多保存 ${MAX_HISTORY} 局`;
+    if (!history.length) { ui.list.innerHTML = '<div class="empty">还没有记录</div>'; return; }
+    ui.list.innerHTML = history.slice(0, 80).map((r) => {
+      const player = (r.hands || []).map((h) => `${(h.cards || []).map(cardHTML).join(' ')} <em>${esc(h.total ?? '')}</em>`).join(' ｜ ');
+      const dealer = `${(r.dealer || []).map(cardHTML).join(' ')} <em>${esc(r.dealerTotal ?? '')}</em>`;
+      const acts = (r.actions || []).map((a) => ACTION_TEXT[a.action] || a.action).join(' → ') || '无操作';
+      const t = new Date(r.ts);
+      const time = `${String(t.getHours()).padStart(2, '0')}:${String(t.getMinutes()).padStart(2, '0')}`;
+      return `<a class="item" href="${esc(r.recordUrl)}" target="_blank" rel="noopener" title="${esc((r.actions || []).map((a) => a.reason).join('；'))}">
+        <div class="cards">${player}</div><div class="amt ${r.net > 0 ? 'pos' : r.net < 0 ? 'neg' : ''}">${signed(r.net)}</div>
+        <div class="sub">庄 ${dealer} · ${esc(acts)} · 押 ${esc(r.staked)} · ${time} · #${esc(r.id)}</div></a>`;
     }).join('');
-    ui.historyBody.innerHTML = rows || '<tr><td colspan="6" class="empty">暂无本地记录</td></tr>';
   }
 
+  let lastHistoryLen = -1;
   function render() {
-    if (!ui?.panel) return;
-    ui.dot.classList.toggle('on', session.running);
-    ui.runMode.disabled = session.running;
-    ui.toggle.textContent = session.running ? '停止自动' : '启动自动';
-    ui.progress.textContent = `${session.settled}/${settings.targetGames || '∞'} 已结算 · ${session.started}/${settings.targetGames || '∞'} 已发起`;
+    const running = session.running;
+    ui.panel.classList.toggle('collapsed', !!settings.collapsed);
+    ui.dot.classList.toggle('on', running);
+    ui.modeLabel.textContent = `${MODE_TEXT[settings.mode]}${running ? ' · 运行中' : ''}`;
+    ui.body.classList.toggle('hidden', !!settings.collapsed);
+    ui.collapse.textContent = settings.collapsed ? '▴' : '▾';
+    ui.mini.classList.toggle('hidden', !settings.collapsed);
+    ui.mini.textContent = signed(session.net);
+    ui.mini.className = `mini ${settings.collapsed ? '' : 'hidden'} ${session.net > 0 ? 'pos' : session.net < 0 ? 'neg' : ''}`;
+
+    ui.net.textContent = signed(session.net);
+    ui.net.className = `net ${session.net > 0 ? 'pos' : session.net < 0 ? 'neg' : ''}`;
+    const rtp = session.wagered > 0 ? `${((session.returned / session.wagered) * 100).toFixed(1)}%` : '—';
+    ui.meta.textContent = `${session.settled} 局 · RTP ${rtp}`;
+    ui.coins.textContent = coins == null ? '—' : String(coins);
+    ui.spark.innerHTML = sparkline();
     ui.status.textContent = statusText;
-    ui.recommend.textContent = recommendationText;
-    ui.balance.textContent = session.currentCoins == null ? '—' : session.currentCoins;
-    ui.wlp.textContent = `${session.wins} / ${session.losses} / ${session.pushes}`;
-    ui.net.textContent = fmtSigned(session.net);
-    ui.net.className = `v ${session.net > 0 ? 'pos' : session.net < 0 ? 'neg' : ''}`;
-    ui.wagered.textContent = String(session.wagered);
-    ui.rtp.textContent = session.wagered > 0 ? `${(session.returned / session.wagered * 100).toFixed(2)}%` : '—';
-    ui.error.textContent = lastStateError ? `状态接口：${lastStateError}` : '';
-    ui.foot.textContent =
-      settings.runMode === 'background'
-        ? '后台稳定：直接使用站点正常 API；页面牌面可能不实时刷新'
-        : '前台可视：使用网页原生按钮，保留发牌/动画';
-    ui.body.hidden = !!settings.collapsed;
-    ui.collapse.textContent = settings.collapsed ? '展开' : '收起';
-    renderHistory();
+    ui.advice.textContent = adviceText;
+    ui.err.textContent = errorText ? `接口：${errorText}` : '';
+
+    qa('[data-tab]').forEach((b) => b.classList.toggle('on', b.dataset.tab === settings.tab));
+    qa('[data-pane]').forEach((p) => p.classList.toggle('hidden', p.dataset.pane !== settings.tab));
+    qa('[data-mode]').forEach((b) => { b.classList.toggle('on', b.dataset.mode === settings.mode); b.disabled = running; });
+    qa('[data-chip]').forEach((b) => {
+      b.classList.toggle('on', Number(b.dataset.chip) === Number(settings.bet));
+      b.disabled = running || settings.mode === 'hint';
+    });
+    fields.actionDelay.disabled = running;
+    ui.delayRow.classList.toggle('hidden', settings.mode !== 'visible');
+
+    ui.toggle.textContent = running ? '停止' : settings.mode === 'hint' ? '开始提示' : '开始自动';
+    ui.toggle.classList.toggle('stop', running);
+    ui.softStop.disabled = !running || settings.mode === 'hint' || session.stopAfterCurrent;
+
+    const target = Number(settings.targetGames) || 0;
+    ui.progressBar.classList.toggle('inf', running && target === 0);
+    ui.bar.style.width = target > 0 ? `${Math.min(100, (session.settled / target) * 100)}%` : '0%';
+    ui.progress.textContent = target > 0
+      ? `已结算 ${session.settled}/${target} · 已发起 ${session.started}`
+      : `已结算 ${session.settled} · 不限局数`;
+
+    const decided = session.wins + session.losses;
+    const set = (k, v) => { q(`[data-s="${k}"]`).textContent = v; };
+    set('wlp', `${session.wins} / ${session.losses} / ${session.pushes}`);
+    set('winrate', decided ? `${((session.wins / decided) * 100).toFixed(1)}%` : '—');
+    set('rtp', rtp);
+    set('wagered', String(session.wagered));
+    set('range', `${signed(session.peak)} / ${signed(session.trough)}`);
+    set('bj', String(session.blackjacks));
+    set('ds', `${session.doubles} / ${session.splits}`);
+    set('busts', String(session.busts));
+    // 期望亏损约为总押注的 0.46%（加倍/分牌会抬高总押注，按押注额计）。
+    set('ev', session.wagered ? signed(Math.round(-session.wagered * 0.0046)) : '—');
+
+    if (settings.tab === 'history' && history.length !== lastHistoryLen) {
+      lastHistoryLen = history.length;
+      renderHistory();
+    } else if (settings.tab !== 'history') {
+      lastHistoryLen = -1;
+    }
   }
 
   function exportCSV() {
-    const lines = [['time','game','bet','staked','paid','net','player','dealer','actions','record']];
+    const rows = [['time', 'game', 'base', 'staked', 'paid', 'net', 'player', 'dealer', 'actions', 'record']];
     for (const r of history) {
-      const player = (r.hands || []).map(h => `${(h.cards || []).join(' ')}=${h.total}:${h.result}`).join(' / ');
-      const dealer = `${(r.dealer || []).join(' ')}=${r.dealerTotal ?? ''}`;
-      const actions = (r.actions || []).map(a => a.reason).join(' | ');
-      lines.push([
+      rows.push([
         new Date(r.ts).toISOString(), r.id, r.base, r.staked, r.paid, r.net,
-        player, dealer, actions, location.origin + r.recordUrl
+        (r.hands || []).map((h) => `${(h.cards || []).join(' ')}=${h.total}:${h.result}`).join(' / '),
+        `${(r.dealer || []).join(' ')}=${r.dealerTotal ?? ''}`,
+        (r.actions || []).map((a) => a.reason).join(' | '),
+        location.origin + r.recordUrl,
       ]);
     }
-    const csv = '\uFEFF' + lines.map(row => row.map(v => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
-    const blob = new Blob([csv], { type: 'text/csv;charset=utf-8' });
+    const csv = '﻿' + rows.map((row) => row.map((v) => `"${String(v ?? '').replace(/"/g, '""')}"`).join(',')).join('\n');
     const a = document.createElement('a');
-    a.href = URL.createObjectURL(blob);
-    a.download = `sb-blackjack-history-${new Date().toISOString().slice(0,10)}.csv`;
+    a.href = URL.createObjectURL(new Blob([csv], { type: 'text/csv;charset=utf-8' }));
+    a.download = `sb-blackjack-${new Date().toISOString().slice(0, 10)}.csv`;
     a.click();
     setTimeout(() => URL.revokeObjectURL(a.href), 1000);
   }
 
-  const panel = document.createElement('section');
-  panel.id = 'bj-auto-pro';
-  panel.innerHTML = `
-    <div class="head">
-      <div class="title"><span id="bja-dot"></span><b>Blackjack Auto Pro</b><small>v2.1</small></div>
-      <button id="bja-collapse" type="button">收起</button>
-    </div>
-    <div id="bja-body">
-      <div class="controls">
-        <label>运行方式
-          <select id="bja-run-mode">
-            <option value="visible">前台可视</option>
-            <option value="background">后台稳定</option>
-          </select>
-        </label>
-        <label>固定下注<select id="bja-bet"></select></label>
-        <label>自动局数<input id="bja-target" type="number" min="0" step="1" title="0 = 无限"></label>
-        <label>操作延迟<input id="bja-delay" type="number" min="120" max="1500" step="10"><span>ms</span></label>
-      </div>
-      <div class="buttons">
-        <button id="bja-toggle" class="primary" type="button">启动自动</button>
-        <button id="bja-sync" type="button">刷新状态</button>
-      </div>
-      <div class="progress" id="bja-progress">0/0</div>
-      <div class="now">
-        <div><span>当前状态</span><b id="bja-status">准备就绪</b></div>
-        <div><span>策略判断</span><b id="bja-rec">—</b></div>
-      </div>
-      <div class="stats">
-        <div><span>余额</span><b id="bja-balance">—</b></div>
-        <div><span>胜 / 负 / 平</span><b id="bja-wlp">0 / 0 / 0</b></div>
-        <div><span>本轮净收益</span><b id="bja-net" class="v">0</b></div>
-        <div><span>总押注</span><b id="bja-wagered">0</b></div>
-        <div><span>本轮 RTP</span><b id="bja-rtp">—</b></div>
-      </div>
-      <div class="history-head">
-        <b>历史记录</b>
-        <div><button id="bja-export" type="button">导出 CSV</button><button id="bja-clear" type="button">清空</button></div>
-      </div>
-      <div class="history-wrap">
-        <table>
-          <thead><tr><th>局</th><th>你的牌</th><th>庄家</th><th>押</th><th>净</th><th>结果</th></tr></thead>
-          <tbody id="bja-history"></tbody>
-        </table>
-      </div>
-      <div id="bja-error" class="error"></div>
-      <div class="foot" id="bja-foot">6 副牌 · S17 · DAS · 不买保险</div>
-    </div>`;
-  document.body.appendChild(panel);
-
-  const style = document.createElement('style');
-  style.textContent = `
-    #bj-auto-pro{position:fixed;right:16px;bottom:16px;z-index:2147483646;width:min(430px,calc(100vw - 24px));font:13px/1.35 system-ui,-apple-system,"Segoe UI",sans-serif;color:#f4f6f8;background:rgba(18,21,27,.97);border:1px solid rgba(255,255,255,.14);border-radius:14px;box-shadow:0 16px 48px rgba(0,0,0,.38);overflow:hidden;backdrop-filter:blur(10px)}
-    #bj-auto-pro *{box-sizing:border-box} #bj-auto-pro button,#bj-auto-pro input,#bj-auto-pro select{font:inherit}
-    #bj-auto-pro .head{display:flex;justify-content:space-between;align-items:center;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.1)}
-    #bj-auto-pro .title{display:flex;align-items:center;gap:7px} #bj-auto-pro .title small{color:#8d98a8}
-    #bj-auto-pro #bja-dot{width:9px;height:9px;border-radius:50%;background:#6d7480} #bj-auto-pro #bja-dot.on{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.12)}
-    #bj-auto-pro .head button,#bj-auto-pro .history-head button{border:1px solid rgba(255,255,255,.15);background:#2a303b;color:#e8edf3;border-radius:7px;padding:4px 8px;cursor:pointer}
-    #bj-auto-pro #bja-body{padding:11px} #bj-auto-pro .controls{display:grid;grid-template-columns:repeat(4,1fr);gap:8px}
-    #bj-auto-pro label{display:flex;flex-direction:column;gap:5px;color:#aeb7c4;font-size:12px;position:relative}
-    #bj-auto-pro input,#bj-auto-pro select{width:100%;height:32px;border-radius:8px;border:1px solid #404957;background:#11151b;color:#fff;padding:0 8px;outline:none}
-    #bj-auto-pro label>span{position:absolute;right:8px;bottom:8px;color:#758092;font-size:10px}
-    #bj-auto-pro .buttons{display:grid;grid-template-columns:2fr 1fr;gap:8px;margin-top:9px}
-    #bj-auto-pro .buttons button{height:35px;border:0;border-radius:8px;background:#333a46;color:#fff;font-weight:700;cursor:pointer}
-    #bj-auto-pro .buttons .primary{background:#e7bd47;color:#171717}
-    #bj-auto-pro .progress{margin:9px 0 7px;color:#9da8b6;font-size:12px;text-align:right}
-    #bj-auto-pro .now{display:grid;gap:6px;padding:9px;border-radius:9px;background:#10141a;border:1px solid rgba(255,255,255,.07)}
-    #bj-auto-pro .now>div{display:grid;grid-template-columns:72px 1fr;gap:8px;align-items:start} #bj-auto-pro .now span{color:#8994a4} #bj-auto-pro .now b{font-weight:600;word-break:break-word}
-    #bj-auto-pro .stats{display:grid;grid-template-columns:repeat(5,1fr);gap:6px;margin-top:8px} #bj-auto-pro .stats>div{background:#252b35;border-radius:8px;padding:7px;min-width:0}
-    #bj-auto-pro .stats span{display:block;color:#8f9aaa;font-size:10px;white-space:nowrap} #bj-auto-pro .stats b{display:block;margin-top:2px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    #bj-auto-pro .pos{color:#63dc8a!important} #bj-auto-pro .neg{color:#ff7b82!important}
-    #bj-auto-pro .history-head{display:flex;align-items:center;justify-content:space-between;margin:11px 0 6px} #bj-auto-pro .history-head>div{display:flex;gap:5px}
-    #bj-auto-pro .history-wrap{max-height:235px;overflow:auto;border:1px solid rgba(255,255,255,.08);border-radius:9px;background:#11151a}
-    #bj-auto-pro table{width:100%;border-collapse:collapse;font-size:11px} #bj-auto-pro th{position:sticky;top:0;background:#202630;color:#aeb7c4;text-align:left;padding:6px;z-index:1}
-    #bj-auto-pro td{padding:6px;border-top:1px solid rgba(255,255,255,.06);vertical-align:top;max-width:120px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
-    #bj-auto-pro td a{color:#8ecbff;text-decoration:none} #bj-auto-pro .empty{text-align:center;color:#798494;padding:15px}
-    #bj-auto-pro .error{min-height:0;color:#ff9499;margin-top:6px;font-size:11px} #bj-auto-pro .foot{margin-top:7px;color:#727d8d;font-size:10px;text-align:center}
-    @media(max-width:560px){#bj-auto-pro{right:8px;bottom:8px;width:calc(100vw - 16px)}#bj-auto-pro .controls{grid-template-columns:1fr 1fr}#bj-auto-pro .stats{grid-template-columns:repeat(3,1fr)}}
-  `;
-  document.head.appendChild(style);
-
-  const ui = {
-    panel,
-    body: $('#bja-body', panel),
-    dot: $('#bja-dot', panel),
-    collapse: $('#bja-collapse', panel),
-    runMode: $('#bja-run-mode', panel),
-    bet: $('#bja-bet', panel),
-    target: $('#bja-target', panel),
-    delay: $('#bja-delay', panel),
-    toggle: $('#bja-toggle', panel),
-    sync: $('#bja-sync', panel),
-    progress: $('#bja-progress', panel),
-    status: $('#bja-status', panel),
-    recommend: $('#bja-rec', panel),
-    balance: $('#bja-balance', panel),
-    wlp: $('#bja-wlp', panel),
-    net: $('#bja-net', panel),
-    wagered: $('#bja-wagered', panel),
-    rtp: $('#bja-rtp', panel),
-    historyBody: $('#bja-history', panel),
-    export: $('#bja-export', panel),
-    clear: $('#bja-clear', panel),
-    error: $('#bja-error', panel),
-    foot: $('#bja-foot', panel),
-  };
-
-  for (const c of CHIPS) {
-    const o = document.createElement('option');
-    o.value = String(c); o.textContent = String(c); ui.bet.appendChild(o);
-  }
-  ui.runMode.value = settings.runMode === 'background' ? 'background' : 'visible';
-  ui.bet.value = String(settings.bet);
-  ui.target.value = String(settings.targetGames);
-  ui.delay.value = String(settings.actionDelay);
-
-  ui.runMode.addEventListener('change', () => {
-    if (session.running) {
-      ui.runMode.value = settings.runMode;
-      return;
-    }
-    settings.runMode = ui.runMode.value === 'background' ? 'background' : 'visible';
-    saveSettings();
-    render();
-  });
-  ui.bet.addEventListener('change', () => { settings.bet = Number(ui.bet.value); saveSettings(); });
-  ui.target.addEventListener('change', () => { settings.targetGames = Math.max(0, parseInt(ui.target.value || '0', 10) || 0); ui.target.value = String(settings.targetGames); saveSettings(); render(); });
-  ui.delay.addEventListener('change', () => { settings.actionDelay = Math.max(120, Math.min(1500, parseInt(ui.delay.value || '350', 10) || 350)); ui.delay.value = String(settings.actionDelay); saveSettings(); });
-  ui.toggle.addEventListener('click', () => session.running ? stopAuto('手动停止') : startAuto());
-  ui.sync.addEventListener('click', () => syncState(true));
-  ui.collapse.addEventListener('click', () => { settings.collapsed = !settings.collapsed; saveSettings(); render(); });
-  ui.export.addEventListener('click', exportCSV);
-  ui.clear.addEventListener('click', () => {
-    if (!confirm('确定清空脚本保存的本地 Blackjack 历史记录？')) return;
-    history = []; localStorage.removeItem(HISTORY_KEY); render();
-  });
-
-  // 状态同步一直运行：即使刚好停止在最后一局结算画面，也能把最后一局写进历史。
-  syncState();
-  syncTimer = setInterval(syncState, 650);
+  // 空闲时轻量同步余额；运行时由主循环负责。
+  setInterval(() => {
+    if (session.running || document.hidden) return;
+    getState().then(render).catch(() => {});
+  }, 4000);
+  getState().then(render).catch(() => render());
   render();
+  requestAnimationFrame(placePanel);
 
-  console.log('[BJ AUTO PRO] v2.1 已加载：支持前台可视与后台稳定 API 模式。');
+  // 控制台自测：__bjAuto.decide(['A','7'], '9', {hit:true,stand:true,double:true,split:false})
+  window.__bjAuto = { version: VERSION, decide, decideFromState };
+  console.log(`[BJ AUTO] v${VERSION} 已加载`);
 })();
