@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sb.sb 消消乐 Auto
 // @namespace    https://sb.sb/
-// @version      2.0.0
+// @version      2.0.1
 // @description  练习/正式计奖双模式：自动找可消除交换，使用网页原生棋盘操作保留动画，并记录成绩与收益。
 // @match        https://sb.sb/games/match-3/*
 // @run-at       document-idle
@@ -72,6 +72,7 @@
   let statusText = '准备就绪';
   let suggestionText = '—';
   let pendingMove = null;
+  let targetHoldGameId = null;
   let nextMoveAt = 0;
   let startClickAt = 0;
   let pollTimer = null;
@@ -371,6 +372,9 @@
   function registerActiveGame(s) {
     if (!s?.id || session.gameIds.has(s.id)) return;
 
+    // 新一局开始后解除上一局因达到目标分数而进入的停手状态。
+    if (targetHoldGameId !== s.id) targetHoldGameId = null;
+
     session.gameIds.add(s.id);
     session.movesByGame.set(s.id, []);
     session.started++;
@@ -548,14 +552,23 @@
       return;
     }
 
+    if (targetHoldGameId === state.id) {
+      statusText =
+        `本局已达到目标分数 ${settings.targetScore}，已停止继续消除，等待本局结算后自动进入下一局`;
+      return;
+    }
+
     if (
       settings.mode === 'formal' &&
       Number(settings.targetScore) > 0 &&
       Number(state.score || 0) >= Number(settings.targetScore)
     ) {
-      stopAuto(
-        `已达到目标分数 ${settings.targetScore}（当前 ${state.score}），自动已暂停；游戏倒计时仍按网站规则继续`
-      );
+      targetHoldGameId = state.id;
+      pendingMove = null;
+      statusText =
+        `本局已达到目标分数 ${settings.targetScore}（当前 ${state.score}），停止继续消除；等待结算后继续下一局`;
+      suggestionText = '本局达标，等待结算';
+      render();
       return;
     }
 
@@ -748,6 +761,7 @@
     session.movesByGame.clear();
 
     pendingMove = null;
+    targetHoldGameId = null;
     nextMoveAt = 0;
     startClickAt = 0;
     suggestionText = '—';
@@ -779,7 +793,7 @@
 ` +
         `每局扣 ${check.entry} 游戏币，目标局数：${target}。
 ` +
-        `目标分数：${scoreTarget}（达到后只暂停自动操作，不暂停网站倒计时）。
+        `目标分数：${scoreTarget}（每局达到后停止继续消除，结算后自动进入下一局）。
 ` +
         `当前余额：${state?.coins ?? '未知'} 游戏币。
 
@@ -818,6 +832,7 @@
   function stopAuto(reason = '手动停止') {
     session.running = false;
     pendingMove = null;
+    targetHoldGameId = null;
     statusText = reason;
     suggestionText = '—';
     render();
