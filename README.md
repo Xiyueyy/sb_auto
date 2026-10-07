@@ -1,15 +1,12 @@
 # sb_auto
 
-sb.sb Blackjack 自动基本策略脚本。
+sb.sb 游戏辅助 Userscript 集合。
 
-## 安装
+## 脚本
 
-1. 安装 Tampermonkey。
-2. 打开 `sb_blackjack_auto.user.js`。
-3. 点击 GitHub 的 **Raw**，Tampermonkey 会识别并提示安装。
-4. 打开 https://sb.sb/games/blackjack/ 。
+### Blackjack Auto Pro
 
-## 当前功能
+文件：`sb_blackjack_auto.user.js`
 
 - 固定下注
 - 指定自动局数（0 = 无限）
@@ -20,4 +17,28 @@ sb.sb Blackjack 自动基本策略脚本。
 - 最近 100 局本地历史
 - CSV 导出
 
-> 该脚本针对 sb.sb 当前 Blackjack 页面结构编写。页面结构变化后可能需要更新。
+页面：https://sb.sb/games/blackjack/
+
+### 消消乐自动练习
+
+文件：`sb_match3_auto.user.js`
+
+- **练习模式锁定**：只会自动开始/续玩“练习一局”
+- 检测到正式计奖局会立即停止，不会替你自动打正式局
+- 自动分析 8×8 棋盘，枚举所有相邻交换
+- 优先选择即时消除数量更高的有效步
+- 通过网页原生 Pointer 事件操作，保留原站交换、消除、连消动画
+- 可设置练习局数（0 = 无限）和每步缓冲时间
+- 当前分、剩余时间、最高分、平均分、有效/无效步统计
+- 最近 100 局本地练习历史
+
+页面：https://sb.sb/games/match-3/
+
+## 安装
+
+1. 安装 Tampermonkey。
+2. 打开需要的 `.user.js` 文件。
+3. 点击 GitHub 的 **Raw**，Tampermonkey 会识别并提示安装。
+4. 打开对应游戏页面并刷新。
+
+> 脚本针对 sb.sb 当前页面结构编写。站点页面或接口变化后可能需要更新。
