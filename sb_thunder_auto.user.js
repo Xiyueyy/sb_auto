@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      1.0.1
+// @version      1.1.0
 // @description  雷霆战机自动驾驶：练习/正式计奖、前台可视/后台稳定、局数控制、智能躲弹与历史统计。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
@@ -50,6 +50,7 @@
     runMode: 'visible',
     strategy: 'balanced',
     targetGames: 1,
+    targetScore: 0,
     autoRestart: true,
     collapsed: false,
   }, loadJSON(SETTINGS_KEY, {}));
@@ -94,6 +95,7 @@
   let bgEnding = false;
   let bgPending = null;
   let bgNextStartAt = 0;
+  let scoreHoldGameId = null;
 
   function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -194,6 +196,7 @@
   function registerStarted(s) {
     if (!s?.id || session.gameIds.has(s.id)) return;
 
+    if (scoreHoldGameId !== s.id) scoreHoldGameId = null;
     session.gameIds.add(s.id);
     session.started++;
     statusText = `${modeLabel(stateMode(s) || settings.mode)}局 #${s.id} 已开始（第 ${session.started} 局）`;
@@ -257,6 +260,7 @@
     bgEnding = false;
     bgPending = null;
     bgNextStartAt = 0;
+    scoreHoldGameId = null;
     releaseKeys();
   }
   function readEngineSnapshot() {
@@ -680,6 +684,22 @@
     const snap = readEngineSnapshot();
     if (!snap) return;
 
+    if (
+      Number(settings.targetScore) > 0 &&
+      snap.score >= Number(settings.targetScore) &&
+      state?.id
+    ) {
+      scoreHoldGameId = state.id;
+    }
+
+    if (scoreHoldGameId === state?.id) {
+      releaseKeys();
+      aiText = '本局已达保分分数，停止自动移动，等待自然结算';
+      statusText = '已达 ' + settings.targetScore + ' 分 · 本局保分中';
+      render();
+      return;
+    }
+
     if (snap.endReason) {
       releaseKeys();
       statusText = '本局结束，等待服务器结算…';
@@ -797,7 +817,22 @@
         break;
       }
 
-      const input = chooseAutoInput(before);
+      if (
+        Number(settings.targetScore) > 0 &&
+        before?.score >= Number(settings.targetScore) &&
+        bgGame?.id
+      ) {
+        scoreHoldGameId = bgGame.id;
+      }
+
+      let input = chooseAutoInput(before);
+
+      if (scoreHoldGameId === bgGame?.id) {
+        // 后台保分：继续躲弹，但关闭自动开火，尽量不再通过击毁增加分数。
+        input &= ~512;
+        aiText = '本局已达保分分数 · 停火保命';
+      }
+
       inputs.push(input);
       engine.step(input);
       bgFrame++;
@@ -987,6 +1022,7 @@
     ui.mode.disabled = session.running;
     ui.runMode.disabled = session.running;
     ui.strategy.disabled = session.running;
+    ui.targetScore.disabled = session.running;
 
     ui.toggle.textContent =
       session.running
@@ -1037,9 +1073,10 @@
       modeLabel() + ' · ' + runModeLabel();
 
     ui.modeDesc.textContent =
-      settings.mode === 'formal'
+      (settings.mode === 'formal'
         ? '每局 ' + ENTRY + ' 游戏币；每天前 ' + (state?.daily_max || 10) + ' 局计奖。'
-        : '练习局不扣币，也不返币。';
+        : '练习局不扣币，也不返币。') +
+      (settings.targetScore > 0 ? ' 保分：' + settings.targetScore + '。' : '');
 
     ui.foot.textContent =
       settings.runMode === 'background'
@@ -1061,6 +1098,7 @@
         ? ui.strategy.value
         : 'balanced';
     settings.targetGames = Math.max(0, parseInt(ui.target.value || '0', 10) || 0);
+    settings.targetScore = Math.max(0, parseInt(ui.targetScore.value || '0', 10) || 0);
     settings.autoRestart = ui.restart.checked;
     saveSettings();
 
@@ -1156,6 +1194,7 @@
     stopBackgroundHeartbeat();
 
     bgPending = null;
+    scoreHoldGameId = null;
     statusText = reason;
     aiText = '—';
 
@@ -1166,7 +1205,7 @@
   panel.id = 'tf-auto-panel';
   panel.innerHTML =
     '<div class="tfa-head">' +
-      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v1.0.1</small></div>' +
+      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v1.1</small></div>' +
       '<button id="tfa-collapse" type="button">收起</button>' +
     '</div>' +
 
@@ -1201,6 +1240,10 @@
 
         '<label>自动局数' +
           '<input id="tfa-target" type="number" min="0" step="1" title="0 = 无限">' +
+        '</label>' +
+
+        '<label>保分分数' +
+          '<input id="tfa-target-score" type="number" min="0" step="100" title="0 = 关闭；后台达标后停火保命">' +
         '</label>' +
 
         '<label class="tfa-check">' +
@@ -1296,6 +1339,7 @@
     runMode: $('#tfa-run-mode', panel),
     strategy: $('#tfa-strategy', panel),
     target: $('#tfa-target', panel),
+    targetScore: $('#tfa-target-score', panel),
     restart: $('#tfa-restart', panel),
     toggle: $('#tfa-toggle', panel),
     sync: $('#tfa-sync', panel),
@@ -1325,6 +1369,7 @@
     ? settings.strategy
     : 'balanced';
   ui.target.value = String(settings.targetGames || 0);
+  ui.targetScore.value = String(settings.targetScore || 0);
   ui.restart.checked = !!settings.autoRestart;
 
   ui.mode.addEventListener('change', () => {
@@ -1365,6 +1410,13 @@
   ui.target.addEventListener('change', () => {
     settings.targetGames = Math.max(0, parseInt(ui.target.value || '0', 10) || 0);
     ui.target.value = String(settings.targetGames);
+    saveSettings();
+    render();
+  });
+
+  ui.targetScore.addEventListener('change', () => {
+    settings.targetScore = Math.max(0, parseInt(ui.targetScore.value || '0', 10) || 0);
+    ui.targetScore.value = String(settings.targetScore);
     saveSettings();
     render();
   });
@@ -1443,5 +1495,5 @@
     chooseAutoInput,
   };
 
-  console.log('[TF AUTO] v1.0.1 已加载：练习/正式计奖 + 前台可视/后台稳定 + 自动躲弹。');
+  console.log('[TF AUTO] v1.1 已加载：练习/正式计奖 + 前台可视/后台稳定 + 保分分数 + 自动躲弹。');
 })();
