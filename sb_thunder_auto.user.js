@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      1.0.0
+// @version      1.0.1
 // @description  雷霆战机自动驾驶：练习/正式计奖、前台可视/后台稳定、局数控制、智能躲弹与历史统计。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
@@ -1002,10 +1002,14 @@
     ui.status.textContent = statusText;
     ui.ai.textContent = aiText;
 
+    const liveSnap = readEngineSnapshot();
+
     ui.score.textContent =
-      state?.status === 'active'
-        ? String(state.score ?? readEngineSnapshot()?.score ?? '—')
-        : String(readEngineSnapshot()?.score ?? '—');
+      liveSnap
+        ? String(liveSnap.score)
+        : state?.score != null
+          ? String(state.score)
+          : '—';
 
     ui.coins.textContent =
       state?.coins != null
@@ -1017,7 +1021,7 @@
     ui.net.textContent = settings.mode === 'formal' ? fmtSigned(session.totalNet) : '—';
     ui.net.className = session.totalNet > 0 ? 'pos' : session.totalNet < 0 ? 'neg' : '';
 
-    const snap = readEngineSnapshot();
+    const snap = liveSnap;
     if (session.running && snap) {
       ui.life.textContent = String(snap.lives);
       ui.power.textContent = String(snap.power);
@@ -1162,7 +1166,7 @@
   panel.id = 'tf-auto-panel';
   panel.innerHTML =
     '<div class="tfa-head">' +
-      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v1</small></div>' +
+      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v1.0.1</small></div>' +
       '<button id="tfa-collapse" type="button">收起</button>' +
     '</div>' +
 
@@ -1439,5 +1443,5 @@
     chooseAutoInput,
   };
 
-  console.log('[TF AUTO] v1 已加载：练习/正式计奖 + 前台可视/后台稳定 + 自动躲弹。');
+  console.log('[TF AUTO] v1.0.1 已加载：练习/正式计奖 + 前台可视/后台稳定 + 自动躲弹。');
 })();
