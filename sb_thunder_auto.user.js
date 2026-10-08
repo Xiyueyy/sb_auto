@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      2.4.1
-// @description  雷霆战机自动驾驶：完整对局验分、保分触控仿真、实际输入字节统计；仿真路线最终分数不低于同局原版基线。
+// @version      2.5.0
+// @description  雷霆战机自动驾驶：回溯修补漏怪、完整对局验分、保分触控仿真、实际输入字节统计；仿真路线最终分数不低于同局基线。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
 // @grant        none
@@ -564,24 +564,178 @@
     return best;
   }
 
-  async function buildCertifiedGame(seed, prefix = [], onProgress = () => {}) {
+  /*
+   * 回溯修补（v2.5）：生成原版路线时逐帧检查"放跑敌机/补给机/增益、受伤"。
+   * 出事后读回 1.6～3.2 秒前的存档，换几组规划参数重走；只有在事发后 1.6 秒的局面里
+   * 失误更少、且分数/生命/火力/连击都不低于原路线时才替换。最终仍由整局验分把关。
+   */
+  const REPAIR_BACK = [96, 192];   // 回溯帧数
+  const REPAIR_AHEAD = 96;         // 修补后继续比较的帧数
+  const REPAIR_CP_GAP = 32;        // 存档间隔
+  const REPAIR_RESERVE_MS = 75000; // 留给整局验分、补交 120 块输入和网络的时间
+  const REPAIR_DEFAULT_MS = 60000; // 服务器未给截止时间时的修补总时长
+  // 按离线统计的成功率排序
+  const REPAIR_VARIANTS = [{ k: 6 }, { esc: 2, h: 30 }, { k: 10 }, { h: 60 }, { esc: 3 }, { k: 5, esc: 2 }, { esc: 4, sup: 2 }];
+  const repairWatched = t => (t >= ENT_LIGHT && t <= ENT_SUPPLY) || (t >= ENT_CORE && t <= ENT_REPAIR);
+
+  function repairEntities() {
+    const n = planner.ints, count = planFill(), out = [];
+    for (let i = 24; i + 5 <= count; i += 5) if (repairWatched(n[i])) out.push({ t: n[i], x: n[i + 1] / FIX, y: n[i + 2] / FIX });
+    return out;
+  }
+
+  // 上一帧还在、这一帧从屏幕边缘消失的目标（被击毁的会在原地变成爆炸，不算）
+  function repairLost(prev, cur) {
+    const used = new Set(), out = [];
+    for (const p of prev) {
+      let bi = -1, bd = 400;
+      cur.forEach((c, i) => {
+        if (used.has(i) || c.t !== p.t) return;
+        const d = (c.x - p.x) ** 2 + (c.y - p.y) ** 2;
+        if (d < bd) { bd = d; bi = i; }
+      });
+      if (bi >= 0) { used.add(bi); continue; }
+      if (p.t >= ENT_CORE ? p.y > 770 && itemReachable(p.x) : p.y > 770 || p.x < -20 || p.x > WIDTH + 20) out.push(p);
+    }
+    return out;
+  }
+
+  function plannerState() {
+    return { held: planner.held, supplyVx: planner.supplyVx, lastSupply: planner.lastSupply && { ...planner.lastSupply }, plan: planner.plan.slice() };
+  }
+
+  function setPlannerState(ps) {
+    Object.assign(planner, { held: ps.held, supplyVx: ps.supplyVx, lastSupply: ps.lastSupply && { ...ps.lastSupply }, plan: ps.plan.slice() });
+  }
+
+  function repairStat() {
+    const n = planner.ints;
+    planFill();
+    return { score: n[1], lives: n[2], power: n[3], combo: n[6], endReason: n[8] };
+  }
+
+  async function generateBaseline(seed, prefix, onProgress, repairUntil) {
     const E = planner.engine;
     plannerReset();
     E.start(String(seed));
     const baseline = prefix.slice();
     for (const input of prefix) E.step(input);
-    for (let f = prefix.length; f < MAX_FRAMES; f++) {
+    const targetScore = Number(settings.targetScore);
+    const checkpoints = [];
+    const stats = { events: 0, fixes: 0, trials: 0, repairMs: 0, startedAt: Date.now(), firstFrame: prefix.length };
+    const repairing = typeof repairUntil === 'function';
+
+    // 从当前局面跑到 to 帧，返回输入与失误记录；tune 只作用到 tuneUntil 帧之前。
+    // 失误数达到 maxEvents 时提前停止（该候选已不可能被采用）。
+    const runFor = (from, to, tune, tuneUntil, record, maxEvents = Infinity) => {
+      const out = [], events = [];
+      let prev = repairEntities();
+      for (let f = from; f < to; f++) {
+        if (record) record(f);
+        const snapScore = planner.ints[1];
+        planner.tune = f < tuneUntil ? tune : null;
+        const input = plannerChoose(false, targetScore > 0 && snapScore >= targetScore, true);
+        const ev = E.step(input);
+        out.push(input);
+        const cur = repairEntities();
+        for (const l of repairLost(prev, cur)) events.push(l);
+        if (ev & 96) events.push({ hurt: true });
+        prev = cur;
+        if (planner.ints[8] || events.length >= maxEvents) break;
+      }
+      planner.tune = null;
+      return { inputs: out, events };
+    };
+    const record = f => {
+      if (planner.plan.length) return;
+      const last = checkpoints[checkpoints.length - 1];
+      if (last && f - last.frame < REPAIR_CP_GAP) return;
+      checkpoints.push({ frame: f, mem: planSave(), ps: plannerState() });
+      while (checkpoints.length && checkpoints[0].frame < f - REPAIR_BACK[REPAIR_BACK.length - 1] - REPAIR_CP_GAP) checkpoints.shift();
+    };
+
+    let f = prefix.length, progressAt = f;
+    while (f < MAX_FRAMES) {
       const before = readPlannerSnapshot();
       if (before.endReason) break;
-      const holdFire = Number(settings.targetScore) > 0 && before.score >= Number(settings.targetScore);
-      const input = plannerChoose(false, holdFire, true);
-      E.step(input); baseline.push(input);
-      if ((f + 1) % FPS === 0) {
-        onProgress({ stage: 'baseline', frame: f + 1, score: readPlannerSnapshot().score });
+      if (!repairing) {
+        const input = plannerChoose(false, targetScore > 0 && before.score >= targetScore, true);
+        E.step(input); baseline.push(input); f++;
+      } else {
+        const step = runFor(f, f + 1, null, 0, record);
+        baseline.push(...step.inputs); f += step.inputs.length;
+        if (step.events.length && !planner.ints[8]) {
+          stats.events++;
+          if (repairUntil(f, stats)) {
+            const repairStart = Date.now();
+            const fix = tryRepair(f, step.events.length);
+            stats.repairMs += Date.now() - repairStart;
+            if (fix) {
+              stats.fixes++;
+              baseline.length = fix.frame;
+              baseline.push(...fix.inputs);
+              f = baseline.length;
+            }
+          }
+        }
+      }
+      if (f - progressAt >= FPS) {
+        progressAt = f;
+        onProgress({ stage: 'baseline', frame: f, score: readPlannerSnapshot().score, fixes: stats.fixes });
         await new Promise(resolve => setTimeout(resolve, 0));
       }
     }
+    return { baseline, stats };
+
+    function tryRepair(at, eventCount) {
+      const here = { mem: planSave(), ps: plannerState() };
+      const ref = runFor(at, at + REPAIR_AHEAD, null, 0, null);
+      const refStat = repairStat();
+      const refEvents = ref.events.length + eventCount;
+      for (const back of REPAIR_BACK) {
+        const cp = [...checkpoints].reverse().find(c => c.frame <= at - back);
+        if (!cp || cp.frame < prefix.length) continue;
+        for (const tune of REPAIR_VARIANTS) {
+          if (!repairUntil(at, stats)) break;
+          stats.trials++;
+          planLoad(cp.mem); setPlannerState(cp.ps);
+          const trial = runFor(cp.frame, at + REPAIR_AHEAD, tune, at, null, refEvents);
+          const s = repairStat();
+          if (trial.events.length >= refEvents || s.endReason === 1 || s.lives < refStat.lives || s.power < refStat.power ||
+            s.combo < refStat.combo || s.score < refStat.score) continue;
+          // 采用：从存档重走到事发帧（确定性，与试走的前段逐帧相同），之后的存档作废。
+          planLoad(cp.mem); setPlannerState(cp.ps);
+          while (checkpoints.length && checkpoints[checkpoints.length - 1].frame > cp.frame) checkpoints.pop();
+          checkpoints.pop();
+          const redo = runFor(cp.frame, at, tune, at, record);
+          for (let i = 0; i < redo.inputs.length; i++) {
+            if (redo.inputs[i] !== trial.inputs[i]) throw new Error('回溯修补重走不一致');
+          }
+          return { frame: cp.frame, inputs: redo.inputs };
+        }
+      }
+      planLoad(here.mem); setPlannerState(here.ps);
+      return null;
+    }
+  }
+
+  async function buildCertifiedGame(seed, prefix = [], onProgress = () => {}, repairUntil = null) {
+    let generated;
+    try {
+      generated = await generateBaseline(seed, prefix, onProgress, repairUntil);
+    } catch (e) {
+      if (!repairUntil || /取消|时限/.test(String(e?.message || e))) throw e;
+      // 修补出错（多为私有引擎异常）：换新引擎，按原版不修补重新生成。
+      console.warn('[TF AUTO] 回溯修补失败，改用原版路线：', e);
+      await loadPlannerEngine(true);
+      generated = await generateBaseline(seed, prefix, onProgress, null);
+    }
+    const { baseline, stats } = generated;
+    // 修补用过存档/读档，验分和提交换一份干净的私有引擎。
+    if (repairUntil) await loadPlannerEngine(true);
+    const E = planner.engine;
     const certificate = await certifySimulationTrace(seed, baseline, prefix.length, onProgress);
+    certificate.repairs = stats;
     certificate.baselineInputs = baseline;
     // 独立重新起局重放选中轨迹，验分通过才允许后台提交它。
     E.start(String(seed));
@@ -651,6 +805,7 @@
     held: 512,
     supplyVx: null,
     lastSupply: null,
+    tune: null,        // 回溯修补时临时替换的规划参数
     ready: false,
   };
   planner.ints = new Int32Array(planner.buf.buffer);
@@ -942,7 +1097,7 @@
 
     const fireMask = holdFire ? ~512 : ~0;
     if (planner.plan.length) return planner.plan.shift() & fireMask;
-    const planK = !forceClassic && !keysOnly && settings.controlStyle === 'natural' ? naturalPlanLength(humanControl, snap.frame) : PLAN_K;
+    const planK = !forceClassic && !keysOnly && settings.controlStyle === 'natural' ? naturalPlanLength(humanControl, snap.frame) : (planner.tune?.k || PLAN_K);
 
     const E = planner.engine;
     const n = planner.ints;
@@ -957,7 +1112,7 @@
     const goal = snap.entities.some(e =>
       e.type === ENT_SUPPLY ||
       (e.type >= ENT_CORE && e.type <= ENT_REPAIR && itemReachable(e.x) && itemWanted(e.type, snap.lives, snap.power, snap.shield) > 0.3));
-    const horizon = goal ? PLAN_H_GOAL : PLAN_H;
+    const horizon = (goal ? PLAN_H_GOAL : PLAN_H) + (planner.tune?.h || 0);
     const bossPhase = snap.bossMax > 0;
     const useNatural = !forceClassic && !keysOnly && settings.controlStyle === 'natural';
     const urgent = needsImmediateControl(snap);
@@ -1000,11 +1155,11 @@
       v += n[1] - snap.score;
       // 漏怪惩罚：刷怪只跟时间有关，各候选在同一时段刷出的怪一样多，
       // 所以"击毁数 + 终点还打得到的数"越小，说明放跑的越多。
-      v += ESCAPE_W * (n[7] - snap.kills + countEnemies(count));
+      v += ESCAPE_W * (planner.tune?.esc || 1) * (n[7] - snap.kills + countEnemies(count));
       // 补给机飞走 = 少一个增益。消失的补给机里，没变成道具的就是飞走了。
       const supGone = Math.max(0, sup0 - countType(count, ENT_SUPPLY));
       const drops = Math.max(0, countType(count, ENT_CORE, ENT_REPAIR) + picks - items0);
-      v -= SUP_ESC * Math.max(0, supGone - drops);
+      v -= SUP_ESC * (planner.tune?.sup || 1) * Math.max(0, supGone - drops);
       if (bossPhase) v += (snap.bossHp - n[9]) * BOSS_W;
       v += (n[3] - snap.power) * 250 + (n[4] - snap.shield) * 300 + (n[2] - snap.lives) * 4000;
       v += leafValue(count);
@@ -1585,16 +1740,26 @@
           throw new Error('整局验分未能在本局服务器时限内完成；已停止提交');
         }
         statusText = p.stage === 'baseline'
-          ? '准备原版高分路线 · ' + Math.floor(p.frame / FPS) + '/120 秒 · ' + p.score + ' 分'
+          ? '准备高分路线 · ' + Math.floor(p.frame / FPS) + '/120 秒 · ' + p.score + ' 分' + (p.fixes ? ' · 修补 ' + p.fixes : '')
           : '整局验分 · 候选 ' + (p.trial + 1) + '/' + p.total + ' · ' + p.score + ' 分';
         render();
       };
-      bgCertificate = await buildCertifiedGame(s.seed, prior, preparationProgress);
+      // 回溯修补只用剩余时间：按已测的规划速度预留剩下的路线生成、整局验分和补交输入。
+      const repairUntil = (frame, stats) => {
+        const left = Number(s.deadline_at) > 0 ? Number(s.deadline_at) - (Date.now() + bgServerOffset) : REPAIR_DEFAULT_MS;
+        const planned = Math.max(1, frame - stats.firstFrame);
+        const perFrame = (Date.now() - stats.startedAt - stats.repairMs) / planned;
+        return left - (MAX_FRAMES - frame) * perFrame * 1.3 > REPAIR_RESERVE_MS &&
+          (Number(s.deadline_at) > 0 || stats.repairMs < REPAIR_DEFAULT_MS);
+      };
+      bgCertificate = await buildCertifiedGame(s.seed, prior, preparationProgress, repairUntil);
       checkPreparation();
+      bgEngine = planner.engine;
       bgEngine.start(String(s.seed));
       for (const input of prior) bgEngine.step(input);
       plannerReset();
-      statusText = '保分仿真已验分：原版 ' + bgCertificate.floor.score + ' → ' + bgCertificate.result.score + ' 分 · ' + bgCertificate.bytes + ' 字节';
+      statusText = '保分仿真已验分：' + bgCertificate.floor.score + ' → ' + bgCertificate.result.score + ' 分 · ' + bgCertificate.bytes + ' 字节' +
+        (bgCertificate.repairs?.fixes ? ' · 回溯修补 ' + bgCertificate.repairs.fixes + ' 处' : '');
     } else {
       statusText = (bgUsePlanner ? '前瞻引擎已就绪' : '后台引擎已就绪') + '，等待开局时间…';
     }
@@ -2161,7 +2326,7 @@
   panel.id = 'tf-auto-panel';
   panel.innerHTML =
     '<div class="tfa-head">' +
-      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.4.1</small></div>' +
+      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.5.0</small></div>' +
       '<button id="tfa-collapse" type="button">收起</button>' +
     '</div>' +
 
@@ -2492,5 +2657,5 @@
     mirror,
   };
 
-  console.log('[TF AUTO] v2.4.1 已加载：原版高分基线 + 整局验分 + 保分触控仿真。');
+  console.log('[TF AUTO] v2.5.0 已加载：回溯修补高分基线 + 整局验分 + 保分触控仿真。');
 })();

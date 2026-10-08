@@ -45,7 +45,7 @@ source = source.replace('  // 便于控制台自检。', `
   window.integrationAPI = {
     settings, ui, session, humanControl, naturalInput, resetHumanControl, naturalPlanLength,
     resetInputStats, inputStats, sendPendingChunk, encodeChunk, decodeInputs,
-    traceBytes, scoreCertificatePass, generateOneChunk, finishBackgroundGame, resetSession, backgroundTick,
+    traceBytes, scoreCertificatePass, repairLost, generateOneChunk, finishBackgroundGame, resetSession, backgroundTick,
     setupCertificate: (certificate, engine) => {
       bgGame = { id: 99, seed: '1', practice: true }; bgFrame = 0; bgSeq = 0;
       bgInputs = []; bgPending = null; bgEnding = false; bgUsePlanner = false;
@@ -190,6 +190,12 @@ async function main() {
   api.settings.controlStyle = 'classic';
   for (const input of [0, 512, 520, 1016]) assert.equal(api.naturalInput(input, 123, 240, 660, api.humanControl), input);
 
+  // 回溯修补只把"活着离开屏幕"的目标算作失误：原地消失（击毁/拾取）和够不着的道具不算。
+  const lostPrev = [{ t: 2, x: 100, y: 775 }, { t: 2, x: 300, y: 400 }, { t: 4, x: 495, y: 200 }, { t: 7, x: 2, y: 790 }, { t: 8, x: 200, y: 790 }];
+  const lostCur = [{ t: 4, x: 497, y: 200 }];
+  assert.equal(api.repairLost(lostPrev, lostCur).map(e => e.t + '@' + e.x).join(), '2@100,8@200');
+  assert.equal(api.repairLost(lostPrev, lostPrev).length, 0);
+
   // 验收必须比较整局终局；短期领先、存活更多或未结束不能替代最终分数。
   const floor = { score: 16315, lives: 3, endReason: 3 };
   assert(api.scoreCertificatePass(floor, { ...floor }));
@@ -258,6 +264,6 @@ async function main() {
   assert.equal(requests, 0);
   assert.equal(api.session.running, false);
   assert.match(api.ui.error.textContent, /尚未完成验分/);
-  console.log('PASS: UI/settings, codec/acknowledgement/retry, random controls, final score guards, certified inputs/fire bits, replay mismatch, settlement mismatch stop, reset, trace exhaustion and uncertified submission prevention');
+  console.log('PASS: UI/settings, codec/acknowledgement/retry, random controls, repair escape detection, final score guards, certified inputs/fire bits, replay mismatch, settlement mismatch stop, reset, trace exhaustion and uncertified submission prevention');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

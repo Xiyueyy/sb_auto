@@ -69,7 +69,7 @@ async function worker() {
 }
 function saveReport() {
   const sorted = [...rows].sort((a,b)=>a.tag.localeCompare(b.tag));
-  const report = { version:'2.4.0',date:'2026-10-08',engineVersion:1,
+  const report = { version:'2.5.0',date:'2026-10-08',engineVersion:1,
     sourceHash,baselineHash,engineHash,seeds,results:sorted,
     passed:sorted.filter(r=>r.scoreFloorPassed && r.byteRangePassed).length,total:seeds.length };
   fs.writeFileSync(path.join(dir,'batch-results.json'),JSON.stringify(report,null,2));

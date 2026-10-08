@@ -10,7 +10,7 @@ const seed = process.argv[4] || '14990132883620190655';
 const limit = Number(process.argv[5] || 7200);
 const outputTag = process.argv[6] || '';
 assert(!outputTag || /^[a-z0-9_-]+$/.test(outputTag));
-assert(['replay', 'replay-output', 'ai', 'ai-classic', 'certified', 'certified-baseline', 'certified-prefix', 'trace-info'].includes(mode), 'Unknown verification mode');
+assert(['replay', 'replay-output', 'ai', 'ai-classic', 'certified', 'certified-repair', 'certified-baseline', 'certified-prefix', 'trace-info'].includes(mode), 'Unknown verification mode');
 const outputStem = filename + (outputTag ? `.${outputTag}` : '');
 globalThis.window = globalThis;
 globalThis.dispatchEvent = () => true;
@@ -49,12 +49,21 @@ async function main() {
   }
   console.log(JSON.stringify({ check: 'HAR codec roundtrip', chunks: chunks.length, frames: chunks.flat().length, bytes }));
   await api.loadPlannerEngine(true);
-  if (['certified-baseline', 'certified', 'certified-prefix'].includes(mode)) {
+  if (['certified-baseline', 'certified', 'certified-repair', 'certified-prefix'].includes(mode)) {
     let certificate;
     const progress = p => {
       if (p.stage !== 'baseline' || p.frame % 600 === 0) console.log(JSON.stringify(p));
     };
-    if (mode !== 'certified') {
+    if (mode === 'certified-repair') {
+      // 与页面一致：模拟 160 秒服务器时限，回溯修补只用剩余时间。
+      const startedAt = Date.now();
+      certificate = await api.buildCertifiedGame(seed, [], progress, (frame, stats) => {
+        const left = 160000 - (Date.now() - startedAt);
+        const perFrame = (Date.now() - stats.startedAt - stats.repairMs) / Math.max(1, frame - stats.firstFrame);
+        return left - (7200 - frame) * perFrame * 1.3 > 75000;
+      });
+      console.log(JSON.stringify({ stage: 'repair', ...certificate.repairs, seconds: (Date.now() - startedAt) / 1000 }));
+    } else if (mode !== 'certified') {
       const baseStem = 'sb_thunder_auto.original.user.js' + (outputTag ? '.' + outputTag : '');
       const baseline = JSON.parse(fs.readFileSync(path.join(dir, `${baseStem}.inputs.json`), 'utf8'));
       const original = JSON.parse(fs.readFileSync(path.join(dir, `${baseStem}.result.json`), 'utf8'));
@@ -85,8 +94,8 @@ async function main() {
       const chunk = certificate.inputs.slice(i, i + 60);
       assert.deepEqual(api.decodeInputs(api.encodeChunk(chunk)), chunk);
     }
-    const result = { filename, version: '2.4.0', seed, ...replayed, entities: undefined,
-      bytes: certificate.bytes, baselineScore: certificate.floor.score,
+    const result = { filename, version: '2.5.0', seed, ...replayed, entities: undefined,
+      repairs: certificate.repairs, bytes: certificate.bytes, baselineScore: certificate.floor.score,
       baselineKills: certificate.floor.kills, baselineLives: certificate.floor.lives,
       baselineFrames: certificate.floor.frame, baselineEndReason: certificate.floor.endReason,
       positionChanges: certificate.positionChanges,
