@@ -269,5 +269,51 @@
     "repository": "Xiyueyy/sb_auto",
     "sourceNormalization": "LF",
     "originalLocalSHA256": "17c01d198d46aa8a01505fa566df2a6609cf9df3e89e64b6bc8b0a538956977c"
+  },
+  "uiRelease": {
+    "version": "2.4.1",
+    "date": "2026-10-08",
+    "scriptSHA256": "a2d4790a1e10597e8f682234c77f409bea58ad676d8e33afda01138484bf5a73",
+    "gameplayCodeIdenticalTo": "2.4.0",
+    "changes": [
+      "viewport height limit",
+      "scrollable panel content",
+      "always visible panel header"
+    ],
+    "verification": {
+      "syntaxCheckPassed": true,
+      "existingUnitAndIntegrationTestsPassed": true,
+      "browser": "Chrome headless, real DOM/CSS, mocked game state",
+      "viewports": [
+        [
+          1280,
+          720
+        ],
+        [
+          1280,
+          480
+        ],
+        [
+          1024,
+          576
+        ],
+        [
+          375,
+          667
+        ],
+        [
+          375,
+          300
+        ],
+        [
+          1280,
+          240
+        ]
+      ],
+      "panelWithinViewportPassed": true,
+      "collapseExpandClicksPassed": true,
+      "selectorsAndStartStopClicksPassed": true,
+      "baselineOverflowReproduced": true
+    }
   }
 }

@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      2.4.0
+// @version      2.4.1
 // @description  雷霆战机自动驾驶：完整对局验分、保分触控仿真、实际输入字节统计；仿真路线最终分数不低于同局原版基线。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
@@ -2161,7 +2161,7 @@
   panel.id = 'tf-auto-panel';
   panel.innerHTML =
     '<div class="tfa-head">' +
-      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.4.0</small></div>' +
+      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.4.1</small></div>' +
       '<button id="tfa-collapse" type="button">收起</button>' +
     '</div>' +
 
@@ -2260,13 +2260,13 @@
 
   const style = document.createElement('style');
   style.textContent = [
-    '#tf-auto-panel{position:fixed;right:16px;bottom:16px;z-index:2147483646;width:min(470px,calc(100vw - 24px));font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;color:#f4f6f8;background:rgba(18,21,27,.97);border:1px solid rgba(255,255,255,.14);border-radius:14px;box-shadow:0 16px 48px rgba(0,0,0,.38);overflow:hidden;backdrop-filter:blur(10px)}',
+    '#tf-auto-panel{position:fixed;right:16px;bottom:16px;z-index:2147483646;width:min(470px,calc(100vw - 24px));max-height:calc(100vh - 32px);max-height:calc(100dvh - 32px);display:flex;flex-direction:column;box-sizing:border-box;font:13px/1.4 system-ui,-apple-system,"Segoe UI",sans-serif;color:#f4f6f8;background:rgba(18,21,27,.97);border:1px solid rgba(255,255,255,.14);border-radius:14px;box-shadow:0 16px 48px rgba(0,0,0,.38);overflow:hidden;backdrop-filter:blur(10px)}',
     '#tf-auto-panel *{box-sizing:border-box}#tf-auto-panel button,#tf-auto-panel input,#tf-auto-panel select{font:inherit}',
-    '#tf-auto-panel .tfa-head{display:flex;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.1)}',
+    '#tf-auto-panel .tfa-head{display:flex;flex-shrink:0;align-items:center;justify-content:space-between;padding:10px 12px;border-bottom:1px solid rgba(255,255,255,.1)}',
     '#tf-auto-panel .tfa-title{display:flex;align-items:center;gap:7px}#tf-auto-panel .tfa-title small{color:#8d98a8}',
     '#tf-auto-panel #tfa-dot{width:9px;height:9px;border-radius:50%;background:#6d7480}#tf-auto-panel #tfa-dot.on{background:#4ade80;box-shadow:0 0 0 3px rgba(74,222,128,.12)}',
     '#tf-auto-panel .tfa-head button,#tf-auto-panel .tfa-history-head button{border:1px solid rgba(255,255,255,.15);background:#2a303b;color:#e8edf3;border-radius:7px;padding:4px 8px;cursor:pointer}',
-    '#tf-auto-panel #tfa-body{padding:11px}',
+    '#tf-auto-panel #tfa-body{padding:11px;min-height:0;overflow-y:auto;overscroll-behavior:contain;scrollbar-gutter:stable}',
     '#tf-auto-panel .tfa-mode-note{display:grid;gap:2px;padding:9px 10px;border-radius:9px;background:#12251a;border:1px solid rgba(74,222,128,.22);margin-bottom:9px}',
     '#tf-auto-panel .tfa-mode-note b{color:#7ee7a0}#tf-auto-panel .tfa-mode-note span{color:#a9b8ae;font-size:11px}',
     '#tf-auto-panel .tfa-mode-note.formal{background:#2a2111;border-color:rgba(231,189,71,.32)}#tf-auto-panel .tfa-mode-note.formal b{color:#f0c85b}',
@@ -2291,7 +2291,7 @@
     '#tf-auto-panel td{padding:6px;border-top:1px solid rgba(255,255,255,.06);max-width:110px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}',
     '#tf-auto-panel td a{color:#8ecbff;text-decoration:none}#tf-auto-panel .empty{text-align:center;color:#798494;padding:15px}',
     '#tf-auto-panel .tfa-error{color:#ff9499;margin-top:6px;font-size:11px}#tf-auto-panel .tfa-foot{margin-top:7px;color:#727d8d;font-size:10px;text-align:center}',
-    '@media(max-width:560px){#tf-auto-panel{right:8px;bottom:8px;width:calc(100vw - 16px)}#tf-auto-panel .tfa-stats{grid-template-columns:repeat(2,1fr)}}'
+    '@media(max-width:560px){#tf-auto-panel{right:8px;bottom:8px;width:calc(100vw - 16px);max-height:calc(100vh - 16px);max-height:calc(100dvh - 16px)}#tf-auto-panel .tfa-stats{grid-template-columns:repeat(2,1fr)}}'
   ].join('');
   document.head.appendChild(style);
 
@@ -2492,5 +2492,5 @@
     mirror,
   };
 
-  console.log('[TF AUTO] v2.4.0 已加载：原版高分基线 + 整局验分 + 保分触控仿真。');
+  console.log('[TF AUTO] v2.4.1 已加载：原版高分基线 + 整局验分 + 保分触控仿真。');
 })();
