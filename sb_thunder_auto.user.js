@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      2.0.1
+// @version      2.1.0
 // @description  雷霆战机自动驾驶：用游戏自己的引擎做前瞻模拟，追杀敌机、拦截补给、吃满增益、击落 Boss；练习/正式计奖、前台可视/后台稳定。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
@@ -332,8 +332,8 @@
   /* ------------------------------------------------------------------ *
    * 前瞻规划 AI（v2）
    * 用一份私有的游戏引擎实例做"先试再走"：每 8 帧把当前局面存档，分别试走
-   * 每个候选方向 8 帧，再按追击策略继续推演 1~2 秒，用引擎算出的真实结果
-   * （得分、击毁、拾取、Boss 掉血、是否受伤）挑最好的方向。
+   * 每个候选方向 8 帧（或全程锁定某个目标追），再按追击策略继续推演 1~2 秒，
+   * 用引擎算出的真实结果（得分、击毁、漏怪、拾取、Boss 掉血、是否受伤）挑最好的。
    * 引擎是确定性的，推演结果与服务器重演完全一致。
    * ------------------------------------------------------------------ */
   const PLAN_K = 8;          // 每次决策执行的帧数
@@ -344,6 +344,20 @@
   const BOLT_V = 14;         // 子弹速度 px/帧
   const PLAYER_V = 6;        // 飞机满速 px/帧
   const ENEMY_POINTS = { 2: 50, 3: 150, 4: 50 };
+  const ESCAPE_W = 120;      // 每放跑一架敌机的惩罚
+  const SUP_ESC = 800;       // 放跑补给机（少一个增益）的惩罚
+  const PICK_V = 600;        // 每吃到一个增益的奖励
+  const CORE_MAX = 0.6;      // 火力满级后核心的想要程度（仍给 100 分）
+  const HUNT_ITEM = 1200;    // 追击策略里增益/补给机/敌机的优先级
+  const HUNT_SUPPLY = 1000;
+  const HUNT_EP = 5;
+  const HUNT_Y = 0.6;
+  const HUNT_DX = 1.2;
+  const LEAF_E = 0.35;       // 推演终点"已对准敌机"的价值
+  const MACRO_N = 4;         // 锁定目标候选的个数
+  const MACRO_TRACK = 40;    // 推演中按坐标追踪同一目标的最大偏移 px
+  const BOSS_W = 0.6;        // Boss 每掉 1 血的价值
+  const BOSS_LEAF = 320;     // 推演终点对准 Boss 的价值
   const ENT_LIGHT = 2, ENT_HEAVY = 3, ENT_SUPPLY = 4, ENT_CORE = 7, ENT_SHIELD = 8, ENT_REPAIR = 9;
 
   const planner = {
@@ -408,6 +422,8 @@
     return -1;
   }
 
+  // Go 的 JS 值表每帧都在变长，整张 _ids 表复制会越来越慢。存档只记数组，
+  // 读档时按差异修补 _ids：删掉推演期间新增的条目，把被回收的旧条目补回去。
   function planSave() {
     if (planner.blocMaxAddr < 0) planner.blocMaxAddr = findBlocMax();
     const go = planner.go;
@@ -415,7 +431,6 @@
       m: new Uint8Array(planner.mem.buffer).slice(),
       v: go._values.slice(),
       r: go._goRefCounts.slice(),
-      ids: new Map(go._ids),
       pool: go._idPool.slice(),
     };
   }
@@ -427,9 +442,20 @@
       new DataView(planner.mem.buffer).setUint32(planner.blocMaxAddr, cur.length, true);
     }
     const go = planner.go;
-    go._values = snap.v.slice();
+    const vals = go._values, ids = go._ids, sv = snap.v, n = sv.length;
+    for (let i = n; i < vals.length; i++) {
+      const v = vals[i];
+      if (v != null && ids.get(v) === i) ids.delete(v);
+    }
+    if (vals.length > n) vals.length = n;
+    for (let i = 0; i < n; i++) {
+      if (vals[i] === sv[i]) continue;
+      const old = vals[i];
+      if (old != null && ids.get(old) === i) ids.delete(old);
+      vals[i] = sv[i];
+      if (sv[i] != null) ids.set(sv[i], i);
+    }
     go._goRefCounts = snap.r.slice();
-    go._ids = new Map(snap.ids);
     go._idPool = snap.pool.slice();
   }
 
@@ -444,8 +470,27 @@
     return out;
   }
 
+  // 终点还能打到的敌机数（已经掉到飞机下方的基本追不回来了）
+  function countType(count, a, b = a) {
+    const n = planner.ints;
+    let c = 0;
+    for (let i = 24; i + 5 <= count; i += 5) if (n[i] >= a && n[i] <= b) c++;
+    return c;
+  }
+
+  function countEnemies(count) {
+    const n = planner.ints;
+    const lim = n[17] - 10 * FIX;
+    let c = 0;
+    for (let i = 24; i + 5 <= count; i += 5) if ((n[i] === ENT_LIGHT || n[i] === ENT_HEAVY) && n[i + 2] < lim) c++;
+    return c;
+  }
+
+  // 补给机在屏幕外被打爆时，道具会落在屏幕外（x<0 或 >480），飞机够不着。
+  const itemReachable = (x) => x > 4 && x < WIDTH - 4;
+
   function itemWanted(t, lives, power, shield) {
-    if (t === ENT_CORE) return power < 5 ? 1.0 : 0.6;     // 满级后也给 100 分
+    if (t === ENT_CORE) return power < 5 ? 1.0 : CORE_MAX;  // 满级后也给 100 分
     if (t === ENT_SHIELD) return shield ? 0.45 : 0.9;
     if (t === ENT_REPAIR) return lives < 3 ? 1.2 : 0.45;
     return 0;
@@ -473,28 +518,80 @@
     for (const [t, x, y] of planEntities(count)) {
       let w, gx = x, gy = 660;
       if (t >= ENT_CORE && t <= ENT_REPAIR) {
-        const want = itemWanted(t, lives, power, shield);
+        const want = itemReachable(x) && itemWanted(t, lives, power, shield);
         if (!want) continue;
         const tReach = Math.max(1, (py - y) / ITEM_V);
         if (Math.abs(x - px) > PLAYER_V * tReach + 30 && y < py) continue;
-        w = 2000 * want - Math.abs(x - px) * 0.8;
+        w = HUNT_ITEM * want - Math.abs(x - px) * 0.8;
         gy = Math.min(700, Math.max(560, y + 40));
       } else if (t === ENT_SUPPLY) {
         gx = supplyLeadX(x, y, py);
-        w = 1500 - Math.abs(gx - px) * 0.8;
+        w = HUNT_SUPPLY - Math.abs(gx - px) * 0.8;
       } else if (t === ENT_LIGHT || t === ENT_HEAVY) {
         if (y > py - 40 || y < -30) continue;
-        w = ENEMY_POINTS[t] * 5 - (py - y) * 0.6 - Math.abs(x - px) * 1.2;
+        w = ENEMY_POINTS[t] * HUNT_EP + y * HUNT_Y - Math.abs(x - px) * HUNT_DX;
       } else continue;
       if (w > best) { best = w; tx = gx; ty = gy; }
     }
-    if (n[10] > 0 && n[9] > 0 && (tx === null || best < 1500)) {
+    if (n[10] > 0 && n[9] > 0 && tx === null) {
       tx = n[18] / FIX;
       ty = Math.min(700, Math.max(560, n[19] / FIX + 450));
     }
     if (tx === null) tx = WIDTH / 2;
     return steerTo(px, py, tx, ty);
   }
+
+  /*
+   * 锁定目标的推演策略：候选里除了"固定方向 8 帧"，再加几条"盯住某个目标一直追"的路线
+   * （某架敌机 / 补给机 / 增益）。按坐标连续追踪同一个目标，它没了就退回普通追击。
+   * 这样规划器能比较"先打哪个"，而不是只看最近的那个，漏怪更少。
+   */
+  function targetCandidates(count) {
+    const n = planner.ints;
+    const px = n[16] / FIX, py = n[17] / FIX, lives = n[2], power = n[3], shield = n[4];
+    const out = [];
+    for (const [t, x, y] of planEntities(count)) {
+      let w;
+      if (t >= ENT_CORE && t <= ENT_REPAIR) {
+        const want = itemReachable(x) && itemWanted(t, lives, power, shield);
+        if (!want || y > py + 10) continue;
+        w = 2000 * want - Math.abs(x - px);
+      } else if (t === ENT_SUPPLY) {
+        w = 1500 - Math.abs(supplyLeadX(x, y, py) - px);
+      } else if (t === ENT_LIGHT || t === ENT_HEAVY) {
+        if (y > py - 40 || y < -40) continue;
+        w = ENEMY_POINTS[t] * 2 + y - Math.abs(x - px) * 0.5;
+      } else continue;
+      out.push({ t, x, y, w });
+    }
+    out.sort((a, b) => b.w - a.w);
+    return out.slice(0, MACRO_N);
+  }
+
+  // 在当前推演局面里找回目标（同类型、离上次位置最近），找不到返回 null
+  function trackTarget(tg, count) {
+    const n = planner.ints;
+    let best = null, bd = MACRO_TRACK * MACRO_TRACK;
+    const ex = tg.x + (tg.t === ENT_SUPPLY ? (planner.supplyVx ?? 0) * HUNT_EVERY : 0);
+    const ey = tg.y + (tg.t === ENT_SUPPLY ? 0 : tg.t === ENT_HEAVY ? 1 * HUNT_EVERY : tg.t === ENT_LIGHT ? 2.4 * HUNT_EVERY : ITEM_V * HUNT_EVERY);
+    for (let i = 24; i + 5 <= count; i += 5) {
+      if (n[i] !== tg.t) continue;
+      const x = n[i + 1] / FIX, y = n[i + 2] / FIX;
+      const d = (x - ex) ** 2 + (y - ey) ** 2;
+      if (d < bd) { bd = d; best = { t: tg.t, x, y }; }
+    }
+    return best;
+  }
+
+  function chaseInput(tg) {
+    const n = planner.ints;
+    const px = n[16] / FIX, py = n[17] / FIX;
+    if (tg.t >= ENT_CORE) return steerTo(px, py, tg.x, Math.min(700, Math.max(560, tg.y + 40)));
+    if (tg.t === ENT_SUPPLY) return steerTo(px, py, supplyLeadX(tg.x, tg.y, py), 660);
+    if (tg.y > py - 30) return null;  // 已经到飞机下方，放弃
+    return steerTo(px, py, tg.x, Math.max(560, Math.min(700, py)));
+  }
+
 
   // 推演终点的局面价值：和敌机/补给机对齐、来得及接住道具、Boss 战对准 Boss。
   function leafValue(count) {
@@ -503,17 +600,17 @@
     let v = 0;
     for (const [t, x, y] of planEntities(count)) {
       if (t >= ENT_CORE && t <= ENT_REPAIR) {
-        const want = itemWanted(t, lives, power, shield);
+        const want = itemReachable(x) && itemWanted(t, lives, power, shield);
         if (!want || y > py + 20) continue;
         const reach = PLAYER_V * Math.max(1, (790 - y) / ITEM_V) - Math.abs(x - px);
         v += 300 * want * (reach > 60 ? 1 - Math.min(1, Math.abs(x - px) / 400) * 0.4 : reach > 0 ? 0.5 : -0.6);
       } else if (t === ENT_SUPPLY) {
         v += 140 * Math.exp(-((supplyLeadX(x, y, py) - px) ** 2) / (2 * 30 * 30));
       } else if ((t === ENT_LIGHT || t === ENT_HEAVY) && y < py - 40) {
-        v += ENEMY_POINTS[t] * 0.35 * Math.exp(-((x - px) ** 2) / (2 * 28 * 28));
+        v += ENEMY_POINTS[t] * LEAF_E * Math.exp(-((x - px) ** 2) / (2 * 28 * 28));
       }
     }
-    if (n[10] > 0 && n[9] > 0) v += 320 * Math.exp(-((n[18] / FIX - px) ** 2) / (2 * 36 * 36));
+    if (n[10] > 0 && n[9] > 0) v += BOSS_LEAF * Math.exp(-((n[18] / FIX - px) ** 2) / (2 * 36 * 36));
     v -= Math.max(0, 540 - py) * 0.3;
     return v;
   }
@@ -544,7 +641,7 @@
     if (count < 24) return null;
     const n = planner.ints;
     return {
-      frame: n[0], score: n[1], lives: n[2], power: n[3], shield: n[4], combo: n[6], endReason: n[8],
+      frame: n[0], score: n[1], lives: n[2], power: n[3], shield: n[4], combo: n[6], kills: n[7], endReason: n[8],
       bossHp: n[9], bossMax: n[10], x: n[16] / FIX, y: n[17] / FIX,
       entities: planEntities(count).map(([type, x, y]) => ({ type, x, y })),
     };
@@ -569,36 +666,56 @@
     const E = planner.engine;
     const n = planner.ints;
     const S = planSave();
-    const cands = (keysOnly ? PLAN_ACTIONS_KEYS : PLAN_ACTIONS).map(a => a & fireMask);
-    if (!keysOnly) cands.push(hunterInput(planFill()) & fireMask);
+    const toKeys = (v) => (keysOnly && (v & 15)) ? encodeInput(((((v >> 4) & 31) + 2) >> 2 << 2) & 31, 8, true) : v;
+    const startCount = planFill();
+    const sup0 = countType(startCount, ENT_SUPPLY), items0 = countType(startCount, ENT_CORE, ENT_REPAIR);
+    // 候选：固定方向走 K 帧再交给追击策略；或者全程锁定某个目标追。
+    const cands = (keysOnly ? PLAN_ACTIONS_KEYS : PLAN_ACTIONS).map(a => ({ a: a & fireMask, tg: null }));
+    if (!keysOnly) cands.push({ a: hunterInput(startCount) & fireMask, tg: null });
+    if (MACRO_N > 0) for (const tg of targetCandidates(startCount)) cands.push({ a: null, tg });
     const goal = snap.entities.some(e =>
       e.type === ENT_SUPPLY ||
-      (e.type >= ENT_CORE && e.type <= ENT_REPAIR && itemWanted(e.type, snap.lives, snap.power, snap.shield) > 0.3));
+      (e.type >= ENT_CORE && e.type <= ENT_REPAIR && itemReachable(e.x) && itemWanted(e.type, snap.lives, snap.power, snap.shield) > 0.3));
     const horizon = goal ? PLAN_H_GOAL : PLAN_H;
     const bossPhase = snap.bossMax > 0;
 
-    let best = -Infinity, bestA = 512, bestHurt = false;
-    for (const a of cands) {
+    let best = -Infinity, bestSeq = null, bestHurt = false, bestTg = null;
+    const seq = new Array(PLAN_K);
+    for (const c of cands) {
       planLoad(S);
-      let v = 0, hurtAt = -1, dead = false, hunt = 512;
+      let v = 0, hurtAt = -1, dead = false, hunt = 512, tg = c.tg, picks = 0;
       for (let f = 0; f < horizon; f++) {
-        let input = a;
-        if (f >= PLAN_K) {
-          if ((f - PLAN_K) % HUNT_EVERY === 0) {
-            hunt = hunterInput(planFill());
-            if (keysOnly && hunt !== 512) hunt = encodeInput(((((hunt >> 4) & 31) + 2) >> 2 << 2) & 31, 8, true);
-            hunt &= fireMask;
+        let input = c.a;
+        if (input === null || f >= PLAN_K) {
+          if (input === null ? f % HUNT_EVERY === 0 : (f - PLAN_K) % HUNT_EVERY === 0) {
+            const cnt = planFill();
+            hunt = null;
+            if (tg) {
+              tg = f ? trackTarget(tg, cnt) : tg;
+              hunt = tg && chaseInput(tg);
+              if (hunt === null) tg = null;
+            }
+            if (hunt === null) hunt = hunterInput(cnt);
+            hunt = toKeys(hunt) & fireMask;
           }
           input = hunt;
         }
+        if (f < PLAN_K) seq[f] = input;
         const ev = E.step(input);
-        if (ev & 16) v += 600;                       // 拾取增益
+        if (ev & 16) { v += PICK_V; picks++; }       // 拾取增益
         if ((ev & 96) && hurtAt < 0) hurtAt = f;     // 受伤（含护盾被打掉）
         if (ev & 1024) { dead = true; break; }       // 坠机
       }
       const count = planFill();
       v += n[1] - snap.score;
-      if (bossPhase) v += (snap.bossHp - n[9]) * 0.6;
+      // 漏怪惩罚：刷怪只跟时间有关，各候选在同一时段刷出的怪一样多，
+      // 所以"击毁数 + 终点还打得到的数"越小，说明放跑的越多。
+      v += ESCAPE_W * (n[7] - snap.kills + countEnemies(count));
+      // 补给机飞走 = 少一个增益。消失的补给机里，没变成道具的就是飞走了。
+      const supGone = Math.max(0, sup0 - countType(count, ENT_SUPPLY));
+      const drops = Math.max(0, countType(count, ENT_CORE, ENT_REPAIR) + picks - items0);
+      v -= SUP_ESC * Math.max(0, supGone - drops);
+      if (bossPhase) v += (snap.bossHp - n[9]) * BOSS_W;
       v += (n[3] - snap.power) * 250 + (n[4] - snap.shield) * 300 + (n[2] - snap.lives) * 4000;
       v += leafValue(count);
       if (n[8] === 3) v += 3000;                     // 击落 Boss 提前结束
@@ -607,16 +724,19 @@
         v -= base * (1.6 - hurtAt / horizon) + snap.combo * 60 + 250;
       }
       if (dead) v -= 80000;
-      if (a === planner.held) v += 2;
-      if (v > best) { best = v; bestA = a; bestHurt = hurtAt >= 0; }
+      if (seq[0] === planner.held) v += 2;
+      if (v > best) { best = v; bestSeq = seq.slice(); bestHurt = hurtAt >= 0; bestTg = c.tg; }
     }
     planLoad(S);
-    planner.held = bestA;
-    planner.plan = Array(PLAN_K - 1).fill(bestA);
+    const bestA = bestSeq[0];
+    planner.held = bestSeq[PLAN_K - 1];
+    planner.plan = bestSeq.slice(1);
 
     const vec = inputVector(bestA);
     const arrows = (vec.dx < -0.3 ? '←' : vec.dx > 0.3 ? '→' : '') + (vec.dy < -0.3 ? '↑' : vec.dy > 0.3 ? '↓' : '');
-    const focus = bossPhase ? 'Boss ' + snap.bossHp : goal ? '拦截补给/增益' : '追击';
+    const focus = bossPhase ? 'Boss ' + snap.bossHp
+      : bestTg ? (bestTg.t >= ENT_CORE ? '抢增益' : bestTg.t === ENT_SUPPLY ? '打补给机' : '锁定敌机')
+      : goal ? '拦截补给/增益' : '追击';
     aiText = '前瞻 · ' + focus + ' · ' + (arrows || '停') + (bestHurt ? ' · 难免受伤' : '');
     return bestA;
   }
