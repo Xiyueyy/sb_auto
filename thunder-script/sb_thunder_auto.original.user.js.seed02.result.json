@@ -1,0 +1,19 @@
+{
+  "filename": "sb_thunder_auto.original.user.js",
+  "seed": "4544080754576429201",
+  "frame": 6907,
+  "score": 16110,
+  "lives": 3,
+  "power": 5,
+  "shield": 1,
+  "combo": 15,
+  "kills": 147,
+  "endReason": 3,
+  "bossHp": 0,
+  "bossMax": 0,
+  "x": 223.25,
+  "y": 541.125,
+  "bytes": 2130,
+  "inputChanges": 627,
+  "seconds": 137.7804
+}

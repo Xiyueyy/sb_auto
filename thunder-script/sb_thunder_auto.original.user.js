@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      2.4.0
-// @description  雷霆战机自动驾驶：完整对局验分、保分触控仿真、实际输入字节统计；仿真路线最终分数不低于同局原版基线。
+// @version      2.1.0
+// @description  雷霆战机自动驾驶：用游戏自己的引擎做前瞻模拟，追杀敌机、拦截补给、吃满增益、击落 Boss；练习/正式计奖、前台可视/后台稳定。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
 // @grant        none
@@ -49,13 +49,11 @@
     mode: 'practice',
     runMode: 'visible',
     strategy: 'balanced',
-    controlStyle: 'natural',
     targetGames: 1,
     targetScore: 0,
     autoRestart: true,
     collapsed: false,
   }, loadJSON(SETTINGS_KEY, {}));
-  if (!['classic', 'natural'].includes(settings.controlStyle)) settings.controlStyle = 'natural';
 
   let history = loadJSON(HISTORY_KEY, []);
   if (!Array.isArray(history)) history = [];
@@ -98,9 +96,6 @@
   let bgPending = null;
   let bgNextStartAt = 0;
   let scoreHoldGameId = null;
-  let bgCertificate = null;
-  let controlEpoch = 0;
-  const inputStats = { gameId: null, frames: 0, bytes: 0, changes: 0, previous: null };
 
   function saveSettings() {
     localStorage.setItem(SETTINGS_KEY, JSON.stringify(settings));
@@ -236,8 +231,6 @@
       entry,
       reward,
       net,
-      inputBytes: inputStats.gameId === s.id ? inputStats.bytes : null,
-      inputChanges: inputStats.gameId === s.id ? inputStats.changes : null,
     });
     history = history.slice(0, MAX_HISTORY);
     saveHistory();
@@ -251,7 +244,6 @@
   }
 
   function resetSession() {
-    controlEpoch++;
     session.started = 0;
     session.settled = 0;
     session.best = 0;
@@ -269,8 +261,6 @@
     bgPending = null;
     bgNextStartAt = 0;
     scoreHoldGameId = null;
-    bgCertificate = null;
-    resetInputStats(null);
     releaseKeys();
   }
   function readEngineSnapshot() {
@@ -307,7 +297,6 @@
       shield: n[4],
       invuln: n[5],
       combo: n[6],
-      kills: n[7],
       endReason: n[8],
       bossHp: n[9],
       bossMax: n[10],
@@ -339,284 +328,15 @@
     };
   }
 
-  // 模拟触控/摇杆的细小修正。只改变真实输入，仍使用原版的最大 RLE 压缩。
-  // 控制器在候选路线中一起推演，选中路线后提交的就是推演过的逐帧输入。
-  const humanControl = {
-    seed: 0, nextFrame: -1, base: 512, output: 512, anchorX: null, anchorY: null,
-    rng: 1, requested: 0, demand: 0, reactAt: -1, heading: 0, velocity: 0,
-    jitter: 0, speedNoise: 0, jitterX: 0, jitterY: 0, paceUntil: -1, precision: 1,
-    pauseUntil: -1, pauseCooldown: 90, responseCount: 0, pauseCount: 0, sampleCount: 0,
-  };
-
-  function resetHumanControl(seed) {
-    let hash = 2166136261;
-    for (const ch of String(seed ?? '0')) hash = Math.imul(hash ^ ch.charCodeAt(0), 16777619);
-    Object.assign(humanControl, {
-      seed: hash >>> 0, nextFrame: -1, base: 512, output: 512, anchorX: null, anchorY: null,
-      rng: (hash ^ 0x9e3779b9) >>> 0, requested: 0, demand: 0, reactAt: -1, heading: 0, velocity: 0,
-      jitter: 0, speedNoise: 0, jitterX: 0, jitterY: 0, paceUntil: -1, precision: 1,
-      pauseUntil: -1, pauseCooldown: 90, responseCount: 0, pauseCount: 0, sampleCount: 0,
-    });
-  }
-
-  // 状态可复制的 PRNG：每条候选从相同的状态推演，只有选中路线的状态才会提交。
-  // 可用同一种子复验；不消耗游戏自身的随机数，也不使用固定周期的正弦波。
-  function controlRandom(control) {
-    control.rng = (control.rng + 0x6d2b79f5) >>> 0;
-    let t = control.rng;
-    t = Math.imul(t ^ (t >>> 15), t | 1);
-    t ^= t + Math.imul(t ^ (t >>> 7), t | 61);
-    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
-  }
-
-  function controlNoise(control) {
-    return controlRandom(control) + controlRandom(control) - 1;
-  }
-
-  function naturalPlanLength(control, frame) {
-    return 9 + ((Math.imul(control.rng ^ frame, 1664525) >>> 0) % 8);
-  }
-
-  function naturalInput(input, frame, x, y, control, urgent = false) {
-    if (settings.controlStyle !== 'natural') return input;
-    const fire = !!(input & 512);
-    const fireBit = fire ? 512 : 0;
-    const motion = (input & 15) ? input & 511 : 0;
-    if (urgent) {
-      Object.assign(control, {
-        base: input, output: input, nextFrame: frame + 1, anchorX: null, anchorY: null,
-        requested: motion, demand: motion, reactAt: -1, pauseUntil: frame,
-        heading: (input >> 4) & 31, velocity: input & 15,
-      });
-      return input;
-    }
-
-    // 改变意图后先保持原动作；微小修正的延迟短，起步/明显转向的延迟较长。
-    // 新意图可以覆盖待响应意图，但不能反复延长响应期限而导致永远不响应。
-    if (motion !== control.requested) {
-      control.requested = motion;
-      if (control.reactAt < frame) {
-        const oldSpeed = control.demand & 15;
-        const newSpeed = motion & 15;
-        const turn = Math.abs(((((motion >> 4) & 31) - ((control.demand >> 4) & 31) + 48) % 32) - 16);
-        const delay = !newSpeed ? 1 + Math.floor(controlRandom(control) * 3)
-          : !oldSpeed ? 4 + Math.floor(controlRandom(control) * 6)
-          : turn >= 5 ? 3 + Math.floor(controlRandom(control) * 5)
-          : Math.floor(controlRandom(control) * 3);
-        control.reactAt = frame + delay;
-        control.responseCount++;
-      }
-    }
-    if (control.reactAt >= 0 && frame >= control.reactAt) {
-      control.demand = control.requested;
-      control.reactAt = -1;
-    }
-    if (frame < control.nextFrame) {
-      control.output = (control.output & 511) | fireBit;
-      return control.output;
-    }
-    control.sampleCount++;
-    if (frame >= control.paceUntil) {
-      control.precision = 0.9 + controlRandom(control) * 0.25;
-      control.paceUntil = frame + 90 + Math.floor(controlRandom(control) * 180);
-    }
-    // 有关联的噪声保留上一时刻的手部惯性，避免独立随机数造成每帧乱跳。
-    control.jitter = Math.max(-1.6, Math.min(1.6, control.jitter * 0.3 + controlNoise(control) * 1.3 * control.precision));
-    control.speedNoise = control.speedNoise * 0.35 + controlNoise(control) * 0.7;
-    const speed = control.demand & 15;
-    if (speed >= 4 && frame >= control.pauseCooldown && controlRandom(control) < 0.003) {
-      control.pauseUntil = frame + 3 + Math.floor(controlRandom(control) * 6);
-      control.pauseCooldown = frame + 90 + Math.floor(controlRandom(control) * 180);
-      control.pauseCount++;
-    }
-    let targetSpeed, targetDir;
-    if (!speed) {
-      if (control.anchorX === null || (control.base & 15)) {
-        control.anchorX = x;
-        control.anchorY = y;
-      }
-      // 停留时围绕固定锚点修正；噪声和目标均受限，不会累计随机漂移。
-      control.jitterX = Math.max(-4, Math.min(4, control.jitterX * 0.55 + controlNoise(control) * 2.1));
-      control.jitterY = Math.max(-3, Math.min(3, control.jitterY * 0.55 + controlNoise(control) * 1.6));
-      const dx = control.anchorX + control.jitterX - x;
-      const dy = control.anchorY + control.jitterY - y;
-      const distance = Math.hypot(dx, dy);
-      targetSpeed = distance < 0.35 ? 0 : Math.min(2, Math.max(1, Math.round(distance * 8 / PLAYER_V)));
-      targetDir = ((Math.round(Math.atan2(dx, -dy) / (Math.PI * 2) * 32) % 32) + 32) % 32;
-      control.heading = targetDir;
-      control.velocity = targetSpeed;
-    } else {
-      control.anchorX = control.anchorY = null;
-      const requestedDir = (control.demand >> 4) & 31;
-      const turn = ((requestedDir - control.heading + 48) % 32) - 16;
-      control.heading = (control.heading + Math.max(-8, Math.min(8, turn * 0.7)) + 32) % 32;
-      targetDir = (Math.round(control.heading + control.jitter) + 32) % 32;
-      const wantedSpeed = frame < control.pauseUntil ? 0 :
-        Math.max(1, speed - 0.15 - Math.max(0, control.speedNoise) * 1.6);
-      control.velocity += Math.max(-3.5, Math.min(3.5, (wantedSpeed - control.velocity) * 0.8));
-      targetSpeed = Math.max(0, Math.min(8, Math.round(control.velocity)));
-    }
-    control.base = control.demand | fireBit;
-    control.output = targetSpeed ? encodeInput(targetDir, targetSpeed, fire) : (fire ? 512 : 0);
-    const cadence = controlRandom(control);
-    control.nextFrame = frame + (cadence < 0.75 ? 1 : cadence < 0.97 ? 2 : 3);
-    return control.output;
-  }
-
-  function needsImmediateControl(snap) {
-    return !!snap && (snap.laserPhase === 2 || snap.entities.some(e =>
-      e.type === 6 && Math.hypot(e.x - snap.x, e.y - snap.y) < 100));
-  }
-
-  function traceBytes(inputs) {
-    let bytes = 0;
-    for (let i = 0; i < inputs.length; i += FPS) bytes += atob(encodeChunk(inputs.slice(i, i + FPS))).length;
-    return bytes;
-  }
-
-  function scoreCertificatePass(reference, candidate) {
-    return candidate.score >= reference.score && candidate.lives >= reference.lives &&
-      (reference.endReason !== 3 || candidate.endReason === 3) && candidate.endReason > 0;
-  }
-
-  function assertCertificateReplay(certificate, replayed) {
-    for (const key of ['frame', 'score', 'kills', 'lives', 'power', 'shield', 'endReason', 'x', 'y']) {
-      if (replayed?.[key] !== certificate.result[key]) throw new Error('保分轨迹重放不一致：' + key);
-    }
-    if (!scoreCertificatePass(certificate.floor, replayed)) throw new Error('保分轨迹未达到原版分数');
-  }
-
-  // 先取得完整高分路线，再模拟触控追踪；每份候选都完整跑到结局并验分。
-  // 此处接受的是本种子的最终成绩，短期的评分函数不充当分数保证。
-  async function certifySimulationTrace(seed, baseline, prefixFrames = 0, onProgress = () => {}) {
-    const E = planner.engine;
-    const reference = [];
-    E.start(String(seed));
-    for (const input of baseline) {
-      E.step(input);
-      const s = readPlannerSnapshot();
-      reference.push({ x: s.x, y: s.y });
-    }
-    const floor = readPlannerSnapshot();
-    const attempts = [];
-    let best = null;
-    const amplitudes = [0.5, 0.65, 0.8, 0.4, 0.3, 0.2, 0.1, 0,
-      0.5, 0.4, 0.55, 0.45, 0.5, 0.4, 0.55, 0.45, 0.5, 0.4, 0.55, 0.45, 0.5, 0.4, 0.55, 0.45];
-    const profiles = [];
-    for (const phase of [{ lead: 0, startFrame: 0 }, { lead: 0, startFrame: 900 }]) {
-      amplitudes.forEach((amplitude, variant) => profiles.push({ ...phase, amplitude, variant }));
-    }
-    for (const startFrame of [2400, 3000]) {
-      for (let variant = 0; variant < 16; variant++) profiles.push({ lead: 0, startFrame, amplitude: [0.75, 0.9, 1.05, 1.2][variant % 4], variant });
-    }
-    for (let trial = 0; trial < profiles.length; trial++) {
-      const { lead, amplitude, variant, startFrame } = profiles[trial];
-      resetHumanControl(String(seed) + ':protected:' + variant);
-      const control = { ...humanControl, touchX: 240, touchY: 680, offsetX: 0, offsetY: 0 };
-      E.start(String(seed));
-      const inputs = [];
-      let positionChanges = 0;
-      for (let f = 0; f < baseline.length; f++) {
-        const before = readPlannerSnapshot();
-        if (before.endReason) break;
-        let input = baseline[f];
-        if (f >= Math.max(prefixFrames, startFrame)) {
-          if (f >= control.nextFrame) {
-            control.offsetX = Math.max(-4, Math.min(4, control.offsetX * 0.3 + controlNoise(control) * amplitude));
-            control.offsetY = Math.max(-3, Math.min(3, control.offsetY * 0.3 + controlNoise(control) * amplitude * 0.65));
-            const cadence = controlRandom(control);
-            control.nextFrame = f + (cadence < 0.78 ? 1 : cadence < 0.98 ? 2 : 3);
-            control.sampleCount++;
-          }
-          const target = reference[Math.min(reference.length - 1, f + lead)];
-          const dx = target.x + control.offsetX - before.x;
-          const dy = target.y + control.offsetY - before.y;
-          const dist = Math.hypot(dx, dy);
-          input = dist < 0.15 ? 512 : encodeInput(Math.round(Math.atan2(dx, -dy) / (2 * Math.PI) * 32), Math.min(8, Math.max(1, Math.round(dist * 8 / PLAYER_V))), true);
-          input = (input & 511) | (baseline[f] & 512);
-        }
-        E.step(input);
-        const after = readPlannerSnapshot();
-        if (after.x !== reference[f].x || after.y !== reference[f].y) positionChanges++;
-        inputs.push(input);
-      }
-      // 提前击败 Boss 可以接受；尚未结束的候选延续最后的路线目标到 120 秒。
-      for (let f = inputs.length; f < MAX_FRAMES && !readPlannerSnapshot().endReason; f++) {
-        const s = readPlannerSnapshot();
-        const target = reference[reference.length - 1];
-        const input = (steerTo(s.x, s.y, target.x, target.y) & 511) | (baseline[baseline.length - 1] & 512);
-        E.step(input); inputs.push(input);
-      }
-      const result = readPlannerSnapshot();
-      const bytes = traceBytes(inputs);
-      const changed = inputs.reduce((n, v, i) => n + (v !== baseline[i] ? 1 : 0), 0);
-      const passed = changed > 0 && positionChanges >= 32 && scoreCertificatePass(floor, result);
-      attempts.push({ trial, lead, amplitude, variant, startFrame, score: result.score, lives: result.lives, endReason: result.endReason, bytes, changed, positionChanges, passed });
-      onProgress({ stage: 'certificate', total: profiles.length, ...attempts[attempts.length - 1] });
-      if (passed) {
-        const candidate = { seed: String(seed), inputs, result, bytes, floor, attempts, positionChanges, profile: { lead, amplitude, variant, startFrame, trial } };
-        if (!best || (bytes >= 7000 && bytes <= 10000 && !(best.bytes >= 7000 && best.bytes <= 10000)) || result.score > best.result.score) best = candidate;
-        if (bytes >= 7000 && bytes <= 10000) return candidate;
-      }
-      await new Promise(resolve => setTimeout(resolve, 0));
-    }
-    if (!best) throw new Error('本种子没有通过最终分数验收的仿真路线');
-    return best;
-  }
-
-  async function buildCertifiedGame(seed, prefix = [], onProgress = () => {}) {
-    const E = planner.engine;
-    plannerReset();
-    E.start(String(seed));
-    const baseline = prefix.slice();
-    for (const input of prefix) E.step(input);
-    for (let f = prefix.length; f < MAX_FRAMES; f++) {
-      const before = readPlannerSnapshot();
-      if (before.endReason) break;
-      const holdFire = Number(settings.targetScore) > 0 && before.score >= Number(settings.targetScore);
-      const input = plannerChoose(false, holdFire, true);
-      E.step(input); baseline.push(input);
-      if ((f + 1) % FPS === 0) {
-        onProgress({ stage: 'baseline', frame: f + 1, score: readPlannerSnapshot().score });
-        await new Promise(resolve => setTimeout(resolve, 0));
-      }
-    }
-    const certificate = await certifySimulationTrace(seed, baseline, prefix.length, onProgress);
-    certificate.baselineInputs = baseline;
-    // 独立重新起局重放选中轨迹，验分通过才允许后台提交它。
-    E.start(String(seed));
-    for (const input of certificate.inputs) E.step(input);
-    const replayed = readPlannerSnapshot();
-    assertCertificateReplay(certificate, replayed);
-    return certificate;
-  }
-
-  function resetInputStats(gameId, prior = [], data = '') {
-    Object.assign(inputStats, {
-      gameId, frames: prior.length, bytes: atob(data || '').length,
-      changes: prior.reduce((sum, v, i) => sum + (i === 0 || v !== prior[i - 1] ? 1 : 0), 0),
-      previous: prior.length ? prior[prior.length - 1] : null,
-    });
-  }
-
-  function countAcceptedInputs(inputs, bytes) {
-    inputStats.frames += inputs.length;
-    inputStats.bytes += bytes;
-    for (const input of inputs) {
-      if (input !== inputStats.previous) inputStats.changes++;
-      inputStats.previous = input;
-    }
-  }
-
 
   /* ------------------------------------------------------------------ *
    * 前瞻规划 AI（v2）
-   * 用一份私有的游戏引擎实例做"先试再走"：原版每 8 帧、仿真操控每 9~16 帧存档，
-   * 试走每个候选方向（或全程锁定某个目标追），再按追击策略继续推演 1~2 秒，
+   * 用一份私有的游戏引擎实例做"先试再走"：每 8 帧把当前局面存档，分别试走
+   * 每个候选方向 8 帧（或全程锁定某个目标追），再按追击策略继续推演 1~2 秒，
    * 用引擎算出的真实结果（得分、击毁、漏怪、拾取、Boss 掉血、是否受伤）挑最好的。
    * 引擎是确定性的，推演结果与服务器重演完全一致。
    * ------------------------------------------------------------------ */
-  const PLAN_K = 8;          // 原版/前台每次决策执行的帧数
+  const PLAN_K = 8;          // 每次决策执行的帧数
   const PLAN_H = 60;         // 普通推演帧数
   const PLAN_H_GOAL = 120;   // 场上有补给机/增益时的推演帧数
   const HUNT_EVERY = 3;      // 推演中追击策略每几帧重算一次
@@ -922,7 +642,7 @@
     const n = planner.ints;
     return {
       frame: n[0], score: n[1], lives: n[2], power: n[3], shield: n[4], combo: n[6], kills: n[7], endReason: n[8],
-      bossHp: n[9], bossMax: n[10], laserX: n[11] / FIX, laserPhase: n[12], x: n[16] / FIX, y: n[17] / FIX,
+      bossHp: n[9], bossMax: n[10], x: n[16] / FIX, y: n[17] / FIX,
       entities: planEntities(count).map(([type, x, y]) => ({ type, x, y })),
     };
   }
@@ -931,7 +651,7 @@
    * 在私有引擎当前局面上选下一帧输入。keysOnly=true 时只用 8 个方向满速（前台键盘可表达）。
    * holdFire=true 时不开火（保分）。
    */
-  function plannerChoose(keysOnly = false, holdFire = false, forceClassic = false) {
+  function plannerChoose(keysOnly = false, holdFire = false) {
     const snap = readPlannerSnapshot();
     if (!snap) return 512;
 
@@ -942,7 +662,6 @@
 
     const fireMask = holdFire ? ~512 : ~0;
     if (planner.plan.length) return planner.plan.shift() & fireMask;
-    const planK = !forceClassic && !keysOnly && settings.controlStyle === 'natural' ? naturalPlanLength(humanControl, snap.frame) : PLAN_K;
 
     const E = planner.engine;
     const n = planner.ints;
@@ -959,20 +678,16 @@
       (e.type >= ENT_CORE && e.type <= ENT_REPAIR && itemReachable(e.x) && itemWanted(e.type, snap.lives, snap.power, snap.shield) > 0.3));
     const horizon = goal ? PLAN_H_GOAL : PLAN_H;
     const bossPhase = snap.bossMax > 0;
-    const useNatural = !forceClassic && !keysOnly && settings.controlStyle === 'natural';
-    const urgent = needsImmediateControl(snap);
 
-    let best = -Infinity, bestSeq = null, bestHurt = false, bestTg = null, bestControl = null;
-    const seq = new Array(planK);
+    let best = -Infinity, bestSeq = null, bestHurt = false, bestTg = null;
+    const seq = new Array(PLAN_K);
     for (const c of cands) {
       planLoad(S);
-      const candidateControl = { ...humanControl };
-      let executedControl = candidateControl;
       let v = 0, hurtAt = -1, dead = false, hunt = 512, tg = c.tg, picks = 0;
       for (let f = 0; f < horizon; f++) {
         let input = c.a;
-        if (input === null || f >= planK) {
-          if (input === null ? f % HUNT_EVERY === 0 : (f - planK) % HUNT_EVERY === 0) {
+        if (input === null || f >= PLAN_K) {
+          if (input === null ? f % HUNT_EVERY === 0 : (f - PLAN_K) % HUNT_EVERY === 0) {
             const cnt = planFill();
             hunt = null;
             if (tg) {
@@ -985,12 +700,7 @@
           }
           input = hunt;
         }
-        if (useNatural) {
-          if (!(input & 15)) planFill();
-          input = naturalInput(input, snap.frame + f, n[16] / FIX, n[17] / FIX, candidateControl, urgent);
-          if (f === planK - 1) executedControl = { ...candidateControl };
-        }
-        if (f < planK) seq[f] = input;
+        if (f < PLAN_K) seq[f] = input;
         const ev = E.step(input);
         if (ev & 16) { v += PICK_V; picks++; }       // 拾取增益
         if ((ev & 96) && hurtAt < 0) hurtAt = f;     // 受伤（含护盾被打掉）
@@ -1015,15 +725,11 @@
       }
       if (dead) v -= 80000;
       if (seq[0] === planner.held) v += 2;
-      if (v > best) {
-        best = v; bestSeq = seq.slice(); bestHurt = hurtAt >= 0; bestTg = c.tg;
-        bestControl = executedControl;
-      }
+      if (v > best) { best = v; bestSeq = seq.slice(); bestHurt = hurtAt >= 0; bestTg = c.tg; }
     }
     planLoad(S);
-    if (useNatural && bestControl) Object.assign(humanControl, bestControl);
     const bestA = bestSeq[0];
-    planner.held = bestSeq[planK - 1];
+    planner.held = bestSeq[PLAN_K - 1];
     planner.plan = bestSeq.slice(1);
 
     const vec = inputVector(bestA);
@@ -1186,7 +892,6 @@
     const origStep = engine.step.bind(engine);
     engine.start = function (seed) {
       const r = origStart(seed);
-      resetHumanControl(seed);
       mirror.synced = false;
       mirror.frames = 0;
       // 每局开一份新的私有引擎，开好后用本局已推进的输入追帧。
@@ -1521,18 +1226,12 @@
     await loadPlannerEngine(true);
     bgEngine = planner.engine;
     plannerReset();
-    resetHumanControl(bgGame.seed);
     bgEngine.start(String(bgGame.seed));
     for (const v of bgInputs) bgEngine.step(v);
     bgRecoveries++;
   }
 
   async function prepareBackgroundGame(s) {
-    const preparationEpoch = controlEpoch;
-    const checkPreparation = () => {
-      if (!session.running || preparationEpoch !== controlEpoch) throw new Error('保分准备已取消');
-    };
-    checkPreparation();
     try {
       await loadPlannerEngine(true);
       bgEngine = planner.engine;
@@ -1543,10 +1242,6 @@
       bgUsePlanner = false;
     }
 
-    checkPreparation();
-    mirror.synced = false;
-    mirror.log = null;
-
     bgGame = s;
     state = s;
     bgServerOffset = Number(s.server_now || Date.now()) - Date.now();
@@ -1554,15 +1249,12 @@
     bgFrame = 0;
     bgEnding = false;
     bgPending = null;
-    bgCertificate = null;
     bgRecoveries = 0;
     plannerReset();
-    resetHumanControl(s.seed);
 
     bgEngine.start(String(s.seed));
 
     const prior = decodeInputs(s.inputs || '');
-    resetInputStats(s.id, prior, s.inputs || '');
     bgInputs = prior.slice();
     for (const input of prior) {
       bgEngine.step(input);
@@ -1570,34 +1262,11 @@
     }
 
     if (prior.length && bgFrame < bgSeq * FPS) {
-      if (settings.controlStyle === 'natural') throw new Error('服务器输入帧数不足，无法建立完整验分基线');
       bgFrame = bgSeq * FPS;
     }
 
     registerStarted(s);
-    if (settings.controlStyle === 'natural') {
-      if (!bgUsePlanner) throw new Error('保分仿真需要私有引擎，不能使用未经验分的兜底路线');
-      const currentGameId = s.id;
-      const preparationProgress = p => {
-        checkPreparation();
-        if (bgGame?.id !== currentGameId) throw new Error('保分准备已取消');
-        if (Number(s.deadline_at) > 0 && Date.now() + bgServerOffset >= Number(s.deadline_at) - 5000) {
-          throw new Error('整局验分未能在本局服务器时限内完成；已停止提交');
-        }
-        statusText = p.stage === 'baseline'
-          ? '准备原版高分路线 · ' + Math.floor(p.frame / FPS) + '/120 秒 · ' + p.score + ' 分'
-          : '整局验分 · 候选 ' + (p.trial + 1) + '/' + p.total + ' · ' + p.score + ' 分';
-        render();
-      };
-      bgCertificate = await buildCertifiedGame(s.seed, prior, preparationProgress);
-      checkPreparation();
-      bgEngine.start(String(s.seed));
-      for (const input of prior) bgEngine.step(input);
-      plannerReset();
-      statusText = '保分仿真已验分：原版 ' + bgCertificate.floor.score + ' → ' + bgCertificate.result.score + ' 分 · ' + bgCertificate.bytes + ' 字节';
-    } else {
-      statusText = (bgUsePlanner ? '前瞻引擎已就绪' : '后台引擎已就绪') + '，等待开局时间…';
-    }
+    statusText = (bgUsePlanner ? '前瞻引擎已就绪' : '后台引擎已就绪') + '，等待开局时间…';
     stateError = '';
     render();
   }
@@ -1635,21 +1304,17 @@
   async function sendPendingChunk() {
     if (!bgPending || !bgGame) return false;
 
-    const pendingAtSend = bgPending;
-    const gameAtSend = bgGame.id;
     const seqAtSend = bgSeq;
     const res = await postAPI(CFG.Input, {
-      game: gameAtSend,
+      game: bgGame.id,
       seq: seqAtSend,
-      data: pendingAtSend.data,
+      data: bgPending.data,
     });
-    if (bgGame?.id !== gameAtSend || bgPending !== pendingAtSend) return false;
 
     const serverChunks = Number(res?.chunks || 0);
     const accepted = !res?.error || serverChunks > seqAtSend;
 
     if (accepted) {
-      countAcceptedInputs(pendingAtSend.inputs, pendingAtSend.bytes);
       bgSeq = Math.max(seqAtSend + 1, serverChunks);
       bgPending = null;
     }
@@ -1672,7 +1337,6 @@
 
   async function generateOneChunk() {
     if (!bgGame || bgPending || bgEnding || !bgEngine) return;
-    if (settings.controlStyle === 'natural' && !bgCertificate) throw new Error('保分仿真尚未完成验分');
 
     const inputs = [];
 
@@ -1704,21 +1368,16 @@
       const holdFire = scoreHoldGameId === bgGame?.id;
       let input;
       try {
-        input = bgCertificate ? bgCertificate.inputs[bgFrame] :
-          bgUsePlanner ? plannerChoose(false, holdFire) : chooseAutoInput(before);
-        if (input === undefined) throw new Error('已验分路线意外用尽');
-        if (!bgUsePlanner && before && !bgCertificate) {
-          input = naturalInput(input, before.frame, before.x, before.y, humanControl, needsImmediateControl(before));
-        }
+        input = bgUsePlanner ? plannerChoose(false, holdFire) : chooseAutoInput(before);
       } catch (e) {
-        if (!bgUsePlanner || bgCertificate) throw e;
+        if (!bgUsePlanner) throw e;
         console.warn('[TF AUTO] 规划出错，重建私有引擎：', e);
         planner.go.exited = true;
         i--;
         continue;
       }
 
-      if (holdFire && !bgCertificate) {
+      if (holdFire) {
         // 后台保分：继续躲弹，但关闭自动开火，尽量不再通过击毁增加分数。
         input &= ~512;
         aiText = '本局已达保分分数 · 停火保命';
@@ -1743,14 +1402,9 @@
       }
     }
 
-    if (bgCertificate && (bgEnding || bgFrame >= MAX_FRAMES)) assertCertificateReplay(bgCertificate, bgSnapshot());
-
     if (inputs.length) {
-      const data = encodeChunk(inputs);
       bgPending = {
-        data,
-        inputs: inputs.slice(),
-        bytes: atob(data).length,
+        data: encodeChunk(inputs),
         frames: inputs.length,
       };
     }
@@ -1768,23 +1422,11 @@
     const result = await postAPI(CFG.Finish, {
       game: bgGame.id,
     });
-    if (result?.error) throw new Error(result.error);
 
     state = result;
-    const reportedScore = Number(result?.score);
-    if (bgCertificate && !Number.isFinite(reportedScore)) {
-      stateError = '服务器结算未返回有效分数；已停止继续开局';
-      stopAuto(stateError);
-    } else {
-      recordSettlement(result);
-      if (bgCertificate && reportedScore < bgCertificate.floor.score) {
-        stateError = '服务器结算 ' + reportedScore + ' 分低于已验分基线 ' + bgCertificate.floor.score + '；已停止继续开局';
-        stopAuto(stateError);
-      }
-    }
+    recordSettlement(result);
 
     bgGame = null;
-    bgCertificate = null;
     bgPending = null;
     bgEnding = false;
     bgNextStartAt = Date.now() + 700;
@@ -1796,7 +1438,6 @@
     if (!session.running || settings.runMode !== 'background' || apiBusy) return;
 
     apiBusy = true;
-    const tickEpoch = controlEpoch;
 
     try {
       if (targetReached()) return;
@@ -1866,7 +1507,6 @@
         await finishBackgroundGame();
       }
     } catch (e) {
-      if (tickEpoch !== controlEpoch || !session.running) return;
       const msg = String(e?.message || e);
       if (bgUsePlanner && /Go program has already exited|null function|unreachable/i.test(msg)) {
         // 私有引擎异常：下一轮生成时会自动重建并重放追帧，不算错误。
@@ -1875,10 +1515,9 @@
       } else {
         stateError = msg;
         statusText = '后台错误：' + stateError;
-        if (settings.controlStyle === 'natural') stopAuto(statusText);
       }
     } finally {
-      if (tickEpoch === controlEpoch) apiBusy = false;
+      apiBusy = false;
       render();
     }
   }
@@ -1965,10 +1604,6 @@
 
     ui.status.textContent = statusText;
     ui.ai.textContent = aiText;
-    const hasInputStats = settings.runMode === 'background' && inputStats.gameId !== null;
-    ui.inputBytes.textContent = hasInputStats ? String(inputStats.bytes) : '—';
-    ui.inputChanges.textContent = hasInputStats ? String(inputStats.changes) : '—';
-    ui.controlStyle.disabled = session.running;
 
     const liveSnap =
       session.running && settings.runMode === 'background' && bgGame && bgUsePlanner
@@ -2015,8 +1650,8 @@
 
     ui.foot.textContent =
       settings.runMode === 'background'
-        ? (settings.controlStyle === 'natural' ? '保分仿真：提交前先整局验分，成绩不低于原版基线；' : '原版操控：') + '每 60 帧提交，统计已确认的 RLE 字节'
-        : '前台可视使用原版方向键；仿真操控与输入统计仅在后台稳定模式生效';
+        ? '后台稳定：前瞻 AI 在私有引擎上推演选路，按正常 Input/Finish 接口每 60 帧提交'
+        : '前台可视：原页面负责渲染和提交；前瞻 AI 镜像同一局面，用方向键操控';
 
     ui.error.textContent = stateError ? '错误：' + stateError : '';
     ui.body.hidden = !!settings.collapsed;
@@ -2028,7 +1663,6 @@
   async function startAuto() {
     settings.mode = ui.mode.value === 'formal' ? 'formal' : 'practice';
     settings.runMode = ui.runMode.value === 'background' ? 'background' : 'visible';
-    settings.controlStyle = ui.controlStyle.value === 'classic' ? 'classic' : 'natural';
     settings.strategy =
       ['survival', 'balanced', 'aggressive'].includes(ui.strategy.value)
         ? ui.strategy.value
@@ -2143,7 +1777,6 @@
   }
 
   function stopAuto(reason = '手动停止') {
-    controlEpoch++;
     session.running = false;
     apiBusy = false;
     releaseKeys();
@@ -2161,7 +1794,7 @@
   panel.id = 'tf-auto-panel';
   panel.innerHTML =
     '<div class="tfa-head">' +
-      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.4.0</small></div>' +
+      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.0.1</small></div>' +
       '<button id="tfa-collapse" type="button">收起</button>' +
     '</div>' +
 
@@ -2183,13 +1816,6 @@
           '<select id="tfa-run-mode">' +
             '<option value="visible">前台可视</option>' +
             '<option value="background">后台稳定</option>' +
-          '</select>' +
-        '</label>' +
-
-        '<label>操控方式（后台）' +
-          '<select id="tfa-control-style">' +
-            '<option value="natural">保分仿真</option>' +
-            '<option value="classic">原版操控</option>' +
           '</select>' +
         '</label>' +
 
@@ -2236,8 +1862,6 @@
         '<div><span>本轮净收益</span><b id="tfa-net">—</b></div>' +
         '<div><span>最高分</span><b id="tfa-best">0</b></div>' +
         '<div><span>平均分</span><b id="tfa-avg">—</b></div>' +
-        '<div><span>已确认操作字节</span><b id="tfa-input-bytes">—</b></div>' +
-        '<div><span>实际输入变化</span><b id="tfa-input-changes">—</b></div>' +
       '</div>' +
 
       '<div class="tfa-history-head">' +
@@ -2303,7 +1927,6 @@
     mode: $('#tfa-mode', panel),
     runMode: $('#tfa-run-mode', panel),
     strategy: $('#tfa-strategy', panel),
-    controlStyle: $('#tfa-control-style', panel),
     target: $('#tfa-target', panel),
     targetScore: $('#tfa-target-score', panel),
     restart: $('#tfa-restart', panel),
@@ -2320,8 +1943,6 @@
     net: $('#tfa-net', panel),
     best: $('#tfa-best', panel),
     avg: $('#tfa-avg', panel),
-    inputBytes: $('#tfa-input-bytes', panel),
-    inputChanges: $('#tfa-input-changes', panel),
     history: $('#tfa-history', panel),
     clear: $('#tfa-clear', panel),
     error: $('#tfa-error', panel),
@@ -2333,7 +1954,6 @@
 
   ui.mode.value = settings.mode === 'formal' ? 'formal' : 'practice';
   ui.runMode.value = settings.runMode === 'background' ? 'background' : 'visible';
-  ui.controlStyle.value = settings.controlStyle;
   ui.strategy.value = ['survival', 'balanced', 'aggressive'].includes(settings.strategy)
     ? settings.strategy
     : 'balanced';
@@ -2372,16 +1992,6 @@
     }
 
     settings.strategy = ui.strategy.value;
-    saveSettings();
-    render();
-  });
-
-  ui.controlStyle.addEventListener('change', () => {
-    if (session.running) {
-      ui.controlStyle.value = settings.controlStyle;
-      return;
-    }
-    settings.controlStyle = ui.controlStyle.value === 'classic' ? 'classic' : 'natural';
     saveSettings();
     render();
   });
@@ -2477,12 +2087,6 @@
     inputVector,
     encodeChunk,
     decodeInputs,
-    naturalInput,
-    resetHumanControl,
-    humanControl,
-    buildCertifiedGame,
-    scoreCertificatePass,
-    inputStats,
     readEngineSnapshot,
     chooseAutoInput,
     plannerChoose,
@@ -2492,5 +2096,5 @@
     mirror,
   };
 
-  console.log('[TF AUTO] v2.4.0 已加载：原版高分基线 + 整局验分 + 保分触控仿真。');
+  console.log('[TF AUTO] v2.0 已加载：前瞻规划 AI + 练习/正式计奖 + 前台可视/后台稳定 + 保分分数。');
 })();

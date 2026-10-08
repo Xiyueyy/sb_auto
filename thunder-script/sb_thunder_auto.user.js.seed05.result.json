@@ -1,0 +1,52 @@
+{
+  "filename": "sb_thunder_auto.user.js",
+  "version": "2.4.0",
+  "seed": "20261008",
+  "frame": 7136,
+  "score": 15925,
+  "lives": 3,
+  "power": 5,
+  "shield": 0,
+  "combo": 15,
+  "kills": 147,
+  "endReason": 3,
+  "bossHp": 0,
+  "bossMax": 0,
+  "laserX": 0,
+  "laserPhase": 0,
+  "x": 321.4375,
+  "y": 659.0625,
+  "bytes": 9090,
+  "baselineScore": 15925,
+  "baselineKills": 147,
+  "baselineLives": 3,
+  "baselineFrames": 7136,
+  "baselineEndReason": 3,
+  "positionChanges": 6935,
+  "changedInputs": 2079,
+  "profile": {
+    "lead": 0,
+    "amplitude": 0.5,
+    "variant": 0,
+    "startFrame": 0,
+    "trial": 0
+  },
+  "attempts": [
+    {
+      "trial": 0,
+      "lead": 0,
+      "amplitude": 0.5,
+      "variant": 0,
+      "startFrame": 0,
+      "score": 15925,
+      "lives": 3,
+      "endReason": 3,
+      "bytes": 9090,
+      "changed": 2079,
+      "positionChanges": 6935,
+      "passed": true
+    }
+  ],
+  "freshReplayPassed": true,
+  "scoreFloorPassed": true
+}
