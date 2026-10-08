@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         sb.sb 雷霆战机 Auto
 // @namespace    https://sb.sb/
-// @version      2.0.0
+// @version      2.0.1
 // @description  雷霆战机自动驾驶：用游戏自己的引擎做前瞻模拟，追杀敌机、拦截补给、吃满增益、击落 Boss；练习/正式计奖、前台可视/后台稳定。
 // @match        https://sb.sb/games/thunder-fighter/*
 // @run-at       document-idle
@@ -361,13 +361,22 @@
   };
   planner.ints = new Int32Array(planner.buf.buffer);
 
-  async function loadPlannerEngine() {
-    if (planner.ready) return planner;
+  let plannerWasmBytes = null;
+
+  /**
+   * 启动一份私有引擎。fresh=true 时丢掉旧实例重新开一份：每局开新的，避免长时间
+   * 存档/读档在 Go 运行时里积累问题；旧实例退出时也靠它重建。
+   */
+  async function loadPlannerEngine(fresh = false) {
+    if (planner.ready && !fresh && !planner.go?.exited) return planner;
     if (!window.Go) throw new Error('页面的 wasm_exec 还没加载');
+    if (!plannerWasmBytes) {
+      plannerWasmBytes = await (await fetch(CFG.Wasm, { credentials: 'same-origin' })).arrayBuffer();
+    }
     const pageEngine = window.bbsThunder;
     const go = new window.Go();
-    const bytes = await (await fetch(CFG.Wasm, { credentials: 'same-origin' })).arrayBuffer();
-    const { instance } = await WebAssembly.instantiate(bytes, go.importObject);
+    go.exit = (code) => { if (code) console.warn('[TF AUTO] 私有引擎退出，代码', code); };
+    const { instance } = await WebAssembly.instantiate(plannerWasmBytes, go.importObject);
     go.run(instance);
     for (let i = 0; i < 200 && window.bbsThunder === pageEngine; i++) await new Promise(r => setTimeout(r, 10));
     const mine = window.bbsThunder;
@@ -377,9 +386,15 @@
     planner.engine = mine;
     planner.go = go;
     planner.mem = instance.exports.mem;
+    planner.blocMaxAddr = -1;
     planner.ready = true;
     return planner;
   }
+
+  function plannerAlive() {
+    return planner.ready && !planner.go?.exited;
+  }
+
 
   // Go 的 wasm 运行时把 sbrk 的 (bloc, blocMax) 放在线性内存里。恢复一个较小的旧存档后
   // 把 blocMax 抬回真实内存大小，运行时就会复用已增长的内存，不会每次都再 grow。
@@ -523,7 +538,9 @@
   }
 
   function readPlannerSnapshot() {
-    const count = planFill();
+    if (!plannerAlive()) return null;
+    let count = 0;
+    try { count = planFill(); } catch { return null; }
     if (count < 24) return null;
     const n = planner.ints;
     return {
@@ -747,7 +764,7 @@
    * 前台镜像：给页面引擎的 start/step 套一层，同步驱动私有引擎，
    * 这样规划器看到的局面和屏幕上一模一样，且不改变页面提交的任何输入。
    * ------------------------------------------------------------------ */
-  const mirror = { hooked: false, synced: false, frames: 0, pending: 0 };
+  const mirror = { hooked: false, synced: false, frames: 0, pending: 0, log: null };
 
   function hookPageEngine(engine) {
     if (!engine || engine.__tfMirror) return;
@@ -755,20 +772,27 @@
     const origStep = engine.step.bind(engine);
     engine.start = function (seed) {
       const r = origStart(seed);
-      try {
-        if (planner.ready) {
-          planner.engine.start(String(seed));
-          plannerReset();
-          mirror.synced = true;
-          mirror.frames = 0;
-        }
-      } catch { mirror.synced = false; }
+      mirror.synced = false;
+      mirror.frames = 0;
+      // 每局开一份新的私有引擎，开好后用本局已推进的输入追帧。
+      const startFrame = mirror.log = [];
+      loadPlannerEngine(true).then(() => {
+        planner.engine.start(String(seed));
+        for (const v of startFrame) planner.engine.step(v);
+        plannerReset();
+        mirror.frames = startFrame.length;
+        mirror.synced = mirror.log === startFrame;
+      }).catch(e => console.warn('[TF AUTO] 私有引擎启动失败，本局用旧 AI：', e));
       return r;
     };
     engine.step = function (input) {
       const r = origStep(input);
+      if (mirror.log) mirror.log.push(input);
       if (mirror.synced) {
-        try { planner.engine.step(input); mirror.frames++; mirror.pending++; } catch { mirror.synced = false; }
+        try {
+          if (!plannerAlive()) throw new Error('exited');
+          planner.engine.step(input); mirror.frames++; mirror.pending++;
+        } catch { mirror.synced = false; }
       }
       return r;
     };
@@ -1041,18 +1065,24 @@
     }
 
     let input;
-    if (planner.ready && mirrorInSync()) {
+    if (plannerAlive() && mirrorInSync()) {
       // 页面每帧推进一次；只在有新帧时重新规划，保持和画面同步。
       if (mirror.pending > 0) {
         mirror.pending = 0;
         planner.plan = [];
-        input = plannerChoose(true, false);
+        try {
+          input = plannerChoose(true, false);
+        } catch (e) {
+          console.warn('[TF AUTO] 前台规划出错，本局改用旧 AI：', e);
+          mirror.synced = false;
+          input = chooseAutoInput(snap);
+        }
         planner.lastVisibleInput = input;
       } else {
         input = planner.lastVisibleInput ?? 512;
       }
     } else {
-      if (planner.ready && mirror.synced) mirror.synced = false;
+      if (mirror.synced) mirror.synced = false;
       input = chooseAutoInput(snap);
     }
     applyVisibleInput(input);
@@ -1069,10 +1099,21 @@
   // 后台模式用的引擎：优先私有规划引擎（可存档推演），失败时退回页面引擎 + 旧 AI。
   let bgEngine = null;
   let bgUsePlanner = false;
+  let bgInputs = [];          // 本局已经生成的全部输入，私有引擎出问题时用来重放追帧
+  let bgRecoveries = 0;
+
+  async function rebuildBackgroundEngine() {
+    await loadPlannerEngine(true);
+    bgEngine = planner.engine;
+    plannerReset();
+    bgEngine.start(String(bgGame.seed));
+    for (const v of bgInputs) bgEngine.step(v);
+    bgRecoveries++;
+  }
 
   async function prepareBackgroundGame(s) {
     try {
-      await loadPlannerEngine();
+      await loadPlannerEngine(true);
       bgEngine = planner.engine;
       bgUsePlanner = true;
     } catch (e) {
@@ -1088,11 +1129,13 @@
     bgFrame = 0;
     bgEnding = false;
     bgPending = null;
+    bgRecoveries = 0;
     plannerReset();
 
     bgEngine.start(String(s.seed));
 
     const prior = decodeInputs(s.inputs || '');
+    bgInputs = prior.slice();
     for (const input of prior) {
       bgEngine.step(input);
       bgFrame++;
@@ -1104,6 +1147,7 @@
 
     registerStarted(s);
     statusText = (bgUsePlanner ? '前瞻引擎已就绪' : '后台引擎已就绪') + '，等待开局时间…';
+    stateError = '';
     render();
   }
 
@@ -1177,6 +1221,16 @@
     const inputs = [];
 
     for (let i = 0; i < FPS && bgFrame < MAX_FRAMES; i++) {
+      if (bgUsePlanner && !plannerAlive()) {
+        // 私有引擎崩了：丢掉这一块里还没提交的输入，重建引擎并重放到当前帧，再重新生成。
+        bgFrame -= inputs.length;
+        bgInputs.length -= inputs.length;
+        inputs.length = 0;
+        await rebuildBackgroundEngine();
+        i = -1;
+        continue;
+      }
+
       const before = bgSnapshot();
       if (before?.endReason) {
         bgEnding = true;
@@ -1192,7 +1246,16 @@
       }
 
       const holdFire = scoreHoldGameId === bgGame?.id;
-      let input = bgUsePlanner ? plannerChoose(false, holdFire) : chooseAutoInput(before);
+      let input;
+      try {
+        input = bgUsePlanner ? plannerChoose(false, holdFire) : chooseAutoInput(before);
+      } catch (e) {
+        if (!bgUsePlanner) throw e;
+        console.warn('[TF AUTO] 规划出错，重建私有引擎：', e);
+        planner.go.exited = true;
+        i--;
+        continue;
+      }
 
       if (holdFire) {
         // 后台保分：继续躲弹，但关闭自动开火，尽量不再通过击毁增加分数。
@@ -1200,8 +1263,16 @@
         aiText = '本局已达保分分数 · 停火保命';
       }
 
+      try {
+        bgEngine.step(input);
+      } catch (e) {
+        if (!bgUsePlanner) throw e;
+        planner.go.exited = true;
+        i--;
+        continue;
+      }
       inputs.push(input);
-      bgEngine.step(input);
+      bgInputs.push(input);
       bgFrame++;
 
       const after = bgSnapshot();
@@ -1220,6 +1291,7 @@
 
     if (bgFrame >= MAX_FRAMES) bgEnding = true;
   }
+
 
 
   async function finishBackgroundGame() {
@@ -1315,8 +1387,15 @@
         await finishBackgroundGame();
       }
     } catch (e) {
-      stateError = String(e?.message || e);
-      statusText = '后台错误：' + stateError;
+      const msg = String(e?.message || e);
+      if (bgUsePlanner && /Go program has already exited|null function|unreachable/i.test(msg)) {
+        // 私有引擎异常：下一轮生成时会自动重建并重放追帧，不算错误。
+        planner.go && (planner.go.exited = true);
+        statusText = '前瞻引擎重建中…';
+      } else {
+        stateError = msg;
+        statusText = '后台错误：' + stateError;
+      }
     } finally {
       apiBusy = false;
       render();
@@ -1526,13 +1605,17 @@
         }
       }
 
-      if (
+      const resumeActive =
         settings.runMode === 'background' &&
-        current?.status === 'active'
-      ) {
-        statusText = '后台稳定模式请在没有进行中牌局时启动；先完成当前局或刷新后再开。';
-        render();
-        return;
+        current?.status === 'active' &&
+        current?.seed;
+      if (resumeActive) {
+        const sm = stateMode(current);
+        if (sm && sm !== settings.mode) {
+          statusText = '有一局进行中的' + modeLabel(sm) + '局，和当前选择的模式不一致；请切换模式后再开始。';
+          render();
+          return;
+        }
       }
 
       resetSession();
@@ -1541,6 +1624,11 @@
       render();
 
       if (settings.runMode === 'background') {
+        if (resumeActive) {
+          // 接管进行中的局（比如上次中断留下的）：按服务器已收到的输入追帧后继续打。
+          await prepareBackgroundGame(current);
+          statusText = '接管进行中的局 #' + current.id + '，从第 ' + Math.floor(bgFrame / FPS) + ' 秒继续';
+        }
         startBackgroundHeartbeat();
         bgNextStartAt = Date.now();
         await backgroundTick();
@@ -1586,7 +1674,7 @@
   panel.id = 'tf-auto-panel';
   panel.innerHTML =
     '<div class="tfa-head">' +
-      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.0</small></div>' +
+      '<div class="tfa-title"><span id="tfa-dot"></span><b>雷霆战机 Auto</b><small>v2.0.1</small></div>' +
       '<button id="tfa-collapse" type="button">收起</button>' +
     '</div>' +
 
