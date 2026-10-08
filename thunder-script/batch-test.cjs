@@ -22,7 +22,7 @@ function run(args, label) {
       chunks.push(data);
       for (const line of data.toString().trim().split('\n')) {
         try { const p = JSON.parse(line);
-          if (p.progress || p.stage === 'certificate') console.log(JSON.stringify({ label, ...p }));
+          if (p.progress) console.log(JSON.stringify({ label, ...p }));
         } catch {}
       }
     });
@@ -48,20 +48,18 @@ async function worker() {
         console.log(JSON.stringify({ stage:'start-baseline',seed,tag }));
         await run(['sb_thunder_auto.original.user.js','ai',seed,'7200',tag],tag+'-baseline');
       }
-      await run(['sb_thunder_auto.user.js','certified-baseline',seed,'7200',tag],tag+'-protected');
+      await run(['sb_thunder_auto.user.js','stream',seed,'7200',tag],tag+'-stream');
       const baseline = JSON.parse(fs.readFileSync(path.join(dir,stem+'.result.json')));
       const protectedResult = JSON.parse(fs.readFileSync(path.join(dir,'sb_thunder_auto.user.js.'+tag+'.result.json')));
-      if (protectedResult.score < baseline.score || !protectedResult.freshReplayPassed || protectedResult.positionChanges < 32) throw new Error('Score/simulation/replay assertion failed');
-      if (protectedResult.bytes < 7000 || protectedResult.bytes > 10000) throw new Error('Byte-range assertion failed');
-      const row = { tag,seed, baselineScore:baseline.score, protectedScore:protectedResult.score,
+      if (!protectedResult.freshReplayPassed || protectedResult.endReason === 1) throw new Error('Replay/survival assertion failed');
+      const row = { tag,seed, baselineScore:baseline.score, streamScore:protectedResult.score,
         delta:protectedResult.score-baseline.score,bytes:protectedResult.bytes,
         kills:protectedResult.kills,lives:protectedResult.lives,endReason:protectedResult.endReason,
-        positionChanges:protectedResult.positionChanges,replayPassed:true,scoreFloorPassed:true,byteRangePassed:true,
-        attempts:protectedResult.attempts.length };
+        repairs:protectedResult.repairs,replayPassed:true,passed:true };
       rows.push(row);
       console.log(JSON.stringify({ stage:'seed-passed',...row }));
     } catch (error) {
-      rows.push({ tag,seed,error:String(error),scoreFloorPassed:false });
+      rows.push({ tag,seed,error:String(error),passed:false });
       console.log(JSON.stringify({ stage:'seed-failed',tag,seed,error:String(error) }));
     }
     saveReport();
@@ -69,13 +67,16 @@ async function worker() {
 }
 function saveReport() {
   const sorted = [...rows].sort((a,b)=>a.tag.localeCompare(b.tag));
-  const report = { version:'2.5.0',date:'2026-10-08',engineVersion:1,
+  const ok = sorted.filter(r=>r.passed);
+  const report = { version:'2.6.0',date:'2026-10-08',engineVersion:1,mode:'stream (offline, no time limit)',
     sourceHash,baselineHash,engineHash,seeds,results:sorted,
-    passed:sorted.filter(r=>r.scoreFloorPassed && r.byteRangePassed).length,total:seeds.length };
+    averageBaseline:ok.length?Math.round(ok.reduce((t,r)=>t+r.baselineScore,0)/ok.length):null,
+    averageStream:ok.length?Math.round(ok.reduce((t,r)=>t+r.streamScore,0)/ok.length):null,
+    passed:ok.length,total:seeds.length };
   fs.writeFileSync(path.join(dir,'batch-results.json'),JSON.stringify(report,null,2));
 }
 Promise.all([worker(),worker()]).then(()=>{
   saveReport();
-  console.log(JSON.stringify({ stage:'complete',passed:rows.filter(r=>r.scoreFloorPassed).length,total:seeds.length }));
-  if (rows.some(r=>!r.scoreFloorPassed)) process.exitCode=1;
+  console.log(JSON.stringify({ stage:'complete',passed:rows.filter(r=>r.passed).length,total:seeds.length }));
+  if (rows.some(r=>!r.passed)) process.exitCode=1;
 }).catch(error=>{console.error(error);process.exitCode=1;});

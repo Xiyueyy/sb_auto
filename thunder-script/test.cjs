@@ -45,13 +45,12 @@ source = source.replace('  // 便于控制台自检。', `
   window.integrationAPI = {
     settings, ui, session, humanControl, naturalInput, resetHumanControl, naturalPlanLength,
     resetInputStats, inputStats, sendPendingChunk, encodeChunk, decodeInputs,
-    traceBytes, scoreCertificatePass, repairLost, generateOneChunk, finishBackgroundGame, resetSession, backgroundTick,
-    setupCertificate: (certificate, engine) => {
+    repairLost, packStreamChunk, generateOneChunk, finishBackgroundGame, resetSession, backgroundTick,
+    setupStream: (gen, expected = null) => {
       bgGame = { id: 99, seed: '1', practice: true }; bgFrame = 0; bgSeq = 0;
-      bgInputs = []; bgPending = null; bgEnding = false; bgUsePlanner = false;
-      bgCertificate = certificate; bgEngine = engine; window.bbsThunder = engine;
+      bgPending = null; bgEnding = false; bgGen = gen; bgExpectedScore = expected;
     },
-    certificate: () => bgCertificate,
+    streamState: () => ({ bgFrame, bgEnding, bgExpectedScore, bgGen }),
     setPending: (id, inputs, seq = 0) => {
       bgGame = { id }; bgSeq = seq;
       const data = encodeChunk(inputs);
@@ -196,74 +195,43 @@ async function main() {
   assert.equal(api.repairLost(lostPrev, lostCur).map(e => e.t + '@' + e.x).join(), '2@100,8@200');
   assert.equal(api.repairLost(lostPrev, lostPrev).length, 0);
 
-  // 验收必须比较整局终局；短期领先、存活更多或未结束不能替代最终分数。
-  const floor = { score: 16315, lives: 3, endReason: 3 };
-  assert(api.scoreCertificatePass(floor, { ...floor }));
-  assert(api.scoreCertificatePass(floor, { ...floor, score: 16400 }));
-  assert(!api.scoreCertificatePass(floor, { ...floor, score: 16314, lives: 4 }));
-  assert(!api.scoreCertificatePass(floor, { ...floor, endReason: 0 }));
-  assert(!api.scoreCertificatePass(floor, { ...floor, endReason: 2 }));
-  assert(!api.scoreCertificatePass(floor, { ...floor, lives: 2 }));
-  assert(api.scoreCertificatePass({ ...floor, endReason: 2 }, { ...floor, endReason: 2 }));
-  const certifiedInputs = [512, 520, 648, 0, 513, 521, 512];
-  let frame = 0;
-  const engine = {
-    step: input => { assert.equal(input, certifiedInputs[frame]); frame++; },
-    fill: buffer => {
-      const n = new Int32Array(buffer.buffer); n.fill(0);
-      n[0] = frame; n[1] = 100; n[2] = 3; n[3] = 1;
-      n[8] = frame === certifiedInputs.length ? 3 : 0;
-      n[16] = 240 * 16; n[17] = 680 * 16;
-      return 24;
-    },
-  };
-  const certificate = { inputs: certifiedInputs, floor: { score: 100, lives: 3, endReason: 3 },
-    result: { frame: 7, score: 100, kills: 0, lives: 3, power: 1, shield: 0, endReason: 3, x: 240, y: 680 } };
-  api.setupCertificate(certificate, engine);
-  api.settings.targetScore = 1;
-  await api.generateOneChunk();
-  assert.deepEqual(Array.from(api.pending().inputs), certifiedInputs);
-  assert.equal(api.pending().bytes, api.traceBytes(certifiedInputs));
-  assert.equal(frame, 7);
-
-  // 即使分数达到下限，实际回放与已验分结果不一致也不能发送最后一块。
-  frame = 0;
-  api.setupCertificate({ ...certificate, result: { ...certificate.result, score: 101 } }, engine);
-  await assert.rejects(api.generateOneChunk(), /重放不一致：score/);
+  // 实时仿真：只在到期时打包下一秒，打包即锁定（修补不再回溯到已提交的帧）。
+  let locked = 0, ended = false;
+  const route = Array.from({ length: 130 }, (_, i) => 512 + (i % 9));
+  const gen = { inputs: route, final: null, lock: f => { locked = f; }, ended: () => ended };
+  api.setupStream(gen);
+  api.packStreamChunk(0);
   assert.equal(api.pending(), null);
-  api.setupCertificate(certificate, engine);
+  api.packStreamChunk(1);
+  assert.deepEqual(Array.from(api.pending().inputs), route.slice(0, 60));
+  assert.equal(locked, 60);
+  api.packStreamChunk(5);
+  assert.equal(api.streamState().bgFrame, 60);
+  api.setPending(99, [], 0);
+  api.setupStream(gen);
+  api.streamState().bgGen.inputs = route.slice(0, 40);
+  api.packStreamChunk(3);
+  assert.equal(api.pending(), null);
+  ended = true; gen.final = { score: 1234 };
+  api.packStreamChunk(3);
+  assert.equal(api.pending().inputs.length, 40);
+  assert.equal(api.streamState().bgEnding, true);
+  assert.equal(api.streamState().bgExpectedScore, 1234);
 
-  // 服务器成绩与验分基线不符时必须停止，不再自动开下一局。
+  // 服务器按同一引擎重放；结算分数与本地引擎不一致时停止，不再自动开下一局。
   api.session.running = true;
   api.settings.targetGames = 0;
+  api.setupStream(gen, 100);
+  fetchBehavior = async () => ({ ok: true, json: async () => ({ id: 99, score: 100, kills: 0, end_reason: 3, practice: true }) });
+  await api.finishBackgroundGame();
+  assert.equal(api.session.running, true);
+  api.setupStream(gen, 100);
   fetchBehavior = async () => ({ ok: true, json: async () => ({ id: 99, score: 99, kills: 0, end_reason: 3, practice: true }) });
   await api.finishBackgroundGame();
   assert.equal(api.session.running, false);
-  assert.match(api.ui.error.textContent, /低于已验分基线/);
-  const settledBeforeInvalid = api.session.settled;
-  api.setupCertificate(certificate, engine);
-  api.session.running = true;
-  fetchBehavior = async () => ({ ok: true, json: async () => ({ id: 99, practice: true }) });
-  await api.finishBackgroundGame();
-  assert.equal(api.session.running, false);
-  assert.equal(api.session.settled, settledBeforeInvalid);
-  assert.match(api.ui.error.textContent, /未返回有效分数/);
+  assert.match(api.ui.error.textContent, /不一致/);
   api.resetSession();
-  assert.equal(api.certificate(), null);
-  api.setupCertificate({ ...certificate, inputs: [] }, engine);
-  frame = 0;
-  await assert.rejects(api.generateOneChunk(), /已验分路线意外用尽/);
-  assert.equal(frame, 0);
-  api.setupCertificate(null, engine);
-  api.settings.controlStyle = 'natural';
-  api.settings.runMode = 'background';
-  api.session.running = true;
-  let requests = 0;
-  fetchBehavior = async () => { requests++; throw new Error('Uncertified input must not be sent'); };
-  await api.backgroundTick();
-  assert.equal(requests, 0);
-  assert.equal(api.session.running, false);
-  assert.match(api.ui.error.textContent, /尚未完成验分/);
-  console.log('PASS: UI/settings, codec/acknowledgement/retry, random controls, repair escape detection, final score guards, certified inputs/fire bits, replay mismatch, settlement mismatch stop, reset, trace exhaustion and uncertified submission prevention');
+  assert.equal(api.streamState().bgGen, null);
+  console.log('PASS: UI/settings, codec/acknowledgement/retry, random controls, repair escape detection, stream chunk packing/locking, settlement mismatch stop and reset');
 }
 main().catch(error => { console.error(error); process.exitCode = 1; });

@@ -1,52 +1,27 @@
 {
   "filename": "sb_thunder_auto.user.js",
-  "version": "2.4.0",
+  "version": "2.6.0",
   "seed": "14990132883620190655",
-  "frame": 7180,
-  "score": 16315,
+  "frame": 7015,
+  "score": 16065,
   "lives": 3,
   "power": 5,
-  "shield": 0,
+  "shield": 1,
   "combo": 15,
-  "kills": 148,
+  "kills": 147,
   "endReason": 3,
   "bossHp": 0,
   "bossMax": 0,
   "laserX": 0,
   "laserPhase": 0,
-  "x": 20,
-  "y": 546.25,
-  "bytes": 8553,
-  "baselineScore": 16315,
-  "baselineKills": 148,
-  "baselineLives": 3,
-  "baselineFrames": 7188,
-  "baselineEndReason": 3,
-  "positionChanges": 7014,
-  "changedInputs": 1929,
-  "profile": {
-    "lead": 0,
-    "amplitude": 0.5,
-    "variant": 0,
-    "startFrame": 0,
-    "trial": 0
+  "x": 328.875,
+  "y": 770,
+  "bytes": 7674,
+  "repairs": {
+    "events": 1,
+    "fixes": 1,
+    "trials": 9
   },
-  "attempts": [
-    {
-      "trial": 0,
-      "lead": 0,
-      "amplitude": 0.5,
-      "variant": 0,
-      "startFrame": 0,
-      "score": 16315,
-      "lives": 3,
-      "endReason": 3,
-      "bytes": 8553,
-      "changed": 1929,
-      "positionChanges": 7014,
-      "passed": true
-    }
-  ],
   "freshReplayPassed": true,
-  "scoreFloorPassed": true
+  "seconds": 47.6
 }

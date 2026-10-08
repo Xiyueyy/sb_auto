@@ -1,8 +1,9 @@
 {
-  "version": "2.4.0",
+  "version": "2.6.0",
   "date": "2026-10-08",
   "engineVersion": 1,
-  "sourceHash": "17c01d198d46aa8a01505fa566df2a6609cf9df3e89e64b6bc8b0a538956977c",
+  "mode": "stream (offline, no time limit)",
+  "sourceHash": "09c6628a74be97fbfd76651da0026bb20a713ffdf243092d8bc469f8cd91ffa1",
   "baselineHash": "c7b5e27fb0f057f80c95bf8f33dca1682c18962a3160115b7a1d3a1383bc8ee5",
   "engineHash": "01a6b402a0ad697ceab88e6deffc6be1bcdb51245a9ece5fd46a850c75622278",
   "seeds": [
@@ -20,131 +21,151 @@
       "tag": "seed01",
       "seed": "14990132883620190655",
       "baselineScore": 16315,
-      "protectedScore": 16315,
-      "delta": 0,
-      "bytes": 8553,
-      "kills": 148,
+      "streamScore": 16065,
+      "delta": -250,
+      "bytes": 7674,
+      "kills": 147,
       "lives": 3,
       "endReason": 3,
-      "positionChanges": 7014,
+      "repairs": {
+        "events": 1,
+        "fixes": 1,
+        "trials": 9
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 1
+      "passed": true
     },
     {
       "tag": "seed02",
       "seed": "4544080754576429201",
       "baselineScore": 16110,
-      "protectedScore": 16110,
-      "delta": 0,
-      "bytes": 7371,
-      "kills": 147,
+      "streamScore": 15865,
+      "delta": -245,
+      "bytes": 6537,
+      "kills": 146,
       "lives": 3,
       "endReason": 3,
-      "positionChanges": 6674,
+      "repairs": {
+        "events": 9,
+        "fixes": 6,
+        "trials": 83,
+        "nofix": 3
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 4
+      "passed": true
     },
     {
       "tag": "seed03",
       "seed": "1",
       "baselineScore": 12570,
-      "protectedScore": 12570,
-      "delta": 0,
-      "bytes": 7590,
-      "kills": 136,
+      "streamScore": 16305,
+      "delta": 3735,
+      "bytes": 8175,
+      "kills": 148,
       "lives": 3,
-      "endReason": 2,
-      "positionChanges": 7138,
+      "endReason": 3,
+      "repairs": {
+        "events": 5,
+        "fixes": 5,
+        "trials": 32
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 10
+      "passed": true
     },
     {
       "tag": "seed04",
       "seed": "42",
       "baselineScore": 15920,
-      "protectedScore": 15920,
-      "delta": 0,
-      "bytes": 7008,
-      "kills": 145,
+      "streamScore": 16305,
+      "delta": 385,
+      "bytes": 8211,
+      "kills": 148,
       "lives": 3,
       "endReason": 3,
-      "positionChanges": 6790,
+      "repairs": {
+        "events": 0,
+        "fixes": 0,
+        "trials": 0
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 14
+      "passed": true
     },
     {
       "tag": "seed05",
       "seed": "20261008",
       "baselineScore": 15925,
-      "protectedScore": 15925,
-      "delta": 0,
-      "bytes": 9090,
-      "kills": 147,
+      "streamScore": 16305,
+      "delta": 380,
+      "bytes": 8544,
+      "kills": 148,
       "lives": 3,
       "endReason": 3,
-      "positionChanges": 6935,
+      "repairs": {
+        "events": 3,
+        "fixes": 3,
+        "trials": 12
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 1
+      "passed": true
     },
     {
       "tag": "seed06",
       "seed": "9223372036854775808",
       "baselineScore": 16070,
-      "protectedScore": 16070,
-      "delta": 0,
-      "bytes": 7947,
-      "kills": 147,
+      "streamScore": 16150,
+      "delta": 80,
+      "bytes": 8634,
+      "kills": 148,
       "lives": 3,
       "endReason": 3,
-      "positionChanges": 3892,
+      "repairs": {
+        "events": 1,
+        "fixes": 0,
+        "trials": 14,
+        "nofix": 1
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 68
+      "passed": true
     },
     {
       "tag": "seed07",
       "seed": "18446744073709551615",
       "baselineScore": 16305,
-      "protectedScore": 16305,
-      "delta": 0,
-      "bytes": 8328,
+      "streamScore": 16295,
+      "delta": -10,
+      "bytes": 8370,
       "kills": 148,
       "lives": 3,
       "endReason": 3,
-      "positionChanges": 6883,
+      "repairs": {
+        "events": 4,
+        "fixes": 4,
+        "trials": 28
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 9
+      "passed": true
     },
     {
       "tag": "seed08",
       "seed": "9876543210123456789",
       "baselineScore": 15820,
-      "protectedScore": 15820,
-      "delta": 0,
-      "bytes": 7623,
-      "kills": 147,
+      "streamScore": 16310,
+      "delta": 490,
+      "bytes": 8664,
+      "kills": 148,
       "lives": 3,
       "endReason": 3,
-      "positionChanges": 4506,
+      "repairs": {
+        "events": 3,
+        "fixes": 3,
+        "trials": 11
+      },
       "replayPassed": true,
-      "scoreFloorPassed": true,
-      "byteRangePassed": true,
-      "attempts": 50
+      "passed": true
     }
   ],
+  "averageBaseline": 15629,
+  "averageStream": 16200,
   "passed": 8,
   "total": 8
 }

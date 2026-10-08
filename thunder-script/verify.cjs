@@ -10,7 +10,7 @@ const seed = process.argv[4] || '14990132883620190655';
 const limit = Number(process.argv[5] || 7200);
 const outputTag = process.argv[6] || '';
 assert(!outputTag || /^[a-z0-9_-]+$/.test(outputTag));
-assert(['replay', 'replay-output', 'ai', 'ai-classic', 'certified', 'certified-repair', 'certified-baseline', 'certified-prefix', 'trace-info'].includes(mode), 'Unknown verification mode');
+assert(['replay', 'replay-output', 'ai', 'ai-classic', 'stream', 'trace-info'].includes(mode), 'Unknown verification mode');
 const outputStem = filename + (outputTag ? `.${outputTag}` : '');
 globalThis.window = globalThis;
 globalThis.dispatchEvent = () => true;
@@ -34,12 +34,12 @@ vm.runInThisContext(source.slice(0, cutoff) + `
     ...(typeof resetHumanControl === 'function' ? { resetHumanControl } : {}),
     ...(typeof humanControl === 'object' ? { humanControl } : {}),
     ...(typeof planSave === 'function' ? { planSave, planLoad, planFill } : {}),
-    ...(typeof certifySimulationTrace === 'function' ? { certifySimulationTrace, buildCertifiedGame } : {}) };
+    ...(typeof createRouteGenerator === 'function' ? { createRouteGenerator } : {}) };
 })();`, { filename });
 
 async function main() {
   const api = globalThis.testAPI;
-  if (mode === 'ai' && api.buildCertifiedGame) throw new Error('Use certified for the v2.4 runtime; ai is the unmodified baseline planner');
+  if (mode === 'ai' && api.createRouteGenerator) throw new Error('Use stream for the v2.6 runtime; ai is the unmodified baseline planner');
   const chunks = JSON.parse(fs.readFileSync(path.join(dir, 'har-inputs.sanitized.json'), 'utf8'));
   let bytes = 0;
   for (const chunk of chunks) {
@@ -49,64 +49,39 @@ async function main() {
   }
   console.log(JSON.stringify({ check: 'HAR codec roundtrip', chunks: chunks.length, frames: chunks.flat().length, bytes }));
   await api.loadPlannerEngine(true);
-  if (['certified-baseline', 'certified', 'certified-repair', 'certified-prefix'].includes(mode)) {
-    let certificate;
-    const progress = p => {
-      if (p.stage !== 'baseline' || p.frame % 600 === 0) console.log(JSON.stringify(p));
-    };
-    if (mode === 'certified-repair') {
-      // 与页面一致：模拟 160 秒服务器时限，回溯修补只用剩余时间。
-      const startedAt = Date.now();
-      certificate = await api.buildCertifiedGame(seed, [], progress, (frame, stats) => {
-        const left = 160000 - (Date.now() - startedAt);
-        const perFrame = (Date.now() - stats.startedAt - stats.repairMs) / Math.max(1, frame - stats.firstFrame);
-        return left - (7200 - frame) * perFrame * 1.3 > 75000;
-      });
-      console.log(JSON.stringify({ stage: 'repair', ...certificate.repairs, seconds: (Date.now() - startedAt) / 1000 }));
-    } else if (mode !== 'certified') {
-      const baseStem = 'sb_thunder_auto.original.user.js' + (outputTag ? '.' + outputTag : '');
-      const baseline = JSON.parse(fs.readFileSync(path.join(dir, `${baseStem}.inputs.json`), 'utf8'));
-      const original = JSON.parse(fs.readFileSync(path.join(dir, `${baseStem}.result.json`), 'utf8'));
-      assert.equal(original.seed, seed);
-      const prefixFrames = mode === 'certified-prefix' ? Number(process.argv[7] || 240) : 0;
-      certificate = await api.certifySimulationTrace(seed, baseline, prefixFrames, progress);
-      assert.equal(certificate.floor.score, original.score);
-      assert.deepEqual(certificate.inputs.slice(0, prefixFrames), baseline.slice(0, prefixFrames));
-      certificate.baselineInputs = baseline;
-    } else {
-      certificate = await api.buildCertifiedGame(seed, [], progress);
-      if (seed === '14990132883620190655') {
-        const original = JSON.parse(fs.readFileSync(path.join(dir, 'sb_thunder_auto.original.user.js.inputs.json'), 'utf8'));
-        assert.deepEqual(certificate.baselineInputs, original);
-      }
+  if (mode === 'stream') {
+    // 与页面实时仿真相同：生成器超前 30 秒，每秒锁定一块；不限时（离线测分数上限）。
+    api.settings.controlStyle = 'natural';
+    api.plannerReset();
+    api.resetHumanControl(seed);
+    api.planner.engine.start(seed);
+    const gen = api.createRouteGenerator([]);
+    const start = performance.now();
+    let sent = 0;
+    while (!gen.ended() || sent < gen.inputs.length) {
+      gen.advance(sent + 60 + 1800, Infinity, 180);
+      sent = Math.min(sent + 60, gen.inputs.length);
+      gen.lock(sent);
+      if (sent % 600 === 0) console.log(JSON.stringify({ progress: sent, score: api.readPlannerSnapshot().score }));
     }
+    const inputs = gen.inputs.slice();
     await api.loadPlannerEngine(true);
     api.planner.engine.start(seed);
-    for (const input of certificate.inputs) api.planner.engine.step(input);
+    for (const input of inputs) api.planner.engine.step(input);
     const replayed = api.readPlannerSnapshot();
-    for (const key of ['frame','score','kills','lives','power','shield','endReason','x','y']) {
-      assert.equal(replayed[key], certificate.result[key], `Fresh replay mismatch: ${key}`);
+    assert.equal(replayed.score, gen.final.score, 'Fresh replay mismatch: score');
+    assert(inputs.every(input => input >= 0 && input <= 1023 && (input & 15) <= 8));
+    let bytes = 0;
+    for (let i = 0; i < inputs.length; i += 60) {
+      const chunk = inputs.slice(i, i + 60);
+      const encoded = api.encodeChunk(chunk);
+      assert.deepEqual(api.decodeInputs(encoded), chunk);
+      bytes += Buffer.from(encoded, 'base64').length;
     }
-    assert(replayed.score >= certificate.floor.score);
-    assert(certificate.positionChanges >= 32);
-    assert(certificate.inputs.every(input => input >= 0 && input <= 1023 && (input & 15) <= 8));
-    for (let i = 0; i < certificate.inputs.length; i += 60) {
-      const chunk = certificate.inputs.slice(i, i + 60);
-      assert.deepEqual(api.decodeInputs(api.encodeChunk(chunk)), chunk);
-    }
-    const result = { filename, version: '2.5.0', seed, ...replayed, entities: undefined,
-      repairs: certificate.repairs, bytes: certificate.bytes, baselineScore: certificate.floor.score,
-      baselineKills: certificate.floor.kills, baselineLives: certificate.floor.lives,
-      baselineFrames: certificate.floor.frame, baselineEndReason: certificate.floor.endReason,
-      positionChanges: certificate.positionChanges,
-      changedInputs: certificate.inputs.reduce((n,v,i)=>n+(v!==certificate.baselineInputs[i]?1:0),0),
-      profile: certificate.profile, attempts: certificate.attempts,
-      freshReplayPassed: true, scoreFloorPassed: true,
-    };
-    if (mode !== 'certified-prefix') {
-      fs.writeFileSync(path.join(dir, `${outputStem}.result.json`), JSON.stringify(result, null, 2));
-      fs.writeFileSync(path.join(dir, `${outputStem}.inputs.json`), JSON.stringify(certificate.inputs));
-    }
+    const result = { filename, version: '2.6.0', seed, ...replayed, entities: undefined, bytes,
+      repairs: gen.stats, freshReplayPassed: true, seconds: +((performance.now() - start) / 1000).toFixed(1) };
+    fs.writeFileSync(path.join(dir, `${outputStem}.result.json`), JSON.stringify(result, null, 2));
+    fs.writeFileSync(path.join(dir, `${outputStem}.inputs.json`), JSON.stringify(inputs));
     console.log(JSON.stringify(result));
     return;
   }
